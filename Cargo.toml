@@ -1,0 +1,46 @@
+[package]
+name = "radio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Recurring SSH-signed broadcasts over the BitTorrent mainline DHT (BEP 44), with circle listening"
+repository = "https://github.com/directionallyai/bittorrent-dht-radio"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "radio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "radio"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+ctrlc = { version = "3", features = ["termination"] }
+directories = "6"
+ed25519-dalek = { version = "2", default-features = false }
+fd-lock = "4"
+futures-lite = "2"
+hex = "0.4"
+humantime = "2"
+mainline = "8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ssh-agent-client-rs = "1.1"
+ssh-encoding = "0.2"
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "encryption", "getrandom"] }
+tempfile = "3"
+thiserror = "2"
+toml = "0.8"
+
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

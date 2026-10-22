@@ -485,6 +485,7 @@ pub fn preflight(
         expires_at: now.saturating_add(ttl_secs.max(1)),
         prev: with_prev.then(|| "0".repeat(crate::payload::PREV_HEX_LEN)),
         message: message.to_string(),
+        sealed: Vec::new(),
     };
     let bytes = p.encode()?;
     crate::item::check_payload_fits(bytes.len())?;
@@ -918,7 +919,7 @@ fn open_direct(inbox: &Inbox, a: &Accepted) -> DirectOutcome {
         .payload
         .header()
         .expect("verified payload has a valid header");
-    let text = match opener.open(&header, &a.payload.message) {
+    let text = match opener.open(&header, &a.payload.sealed) {
         Ok(bytes) => bytes,
         Err(e) => return DirectOutcome::Rejected(Reject::DecryptFailed(e.to_string())),
     };

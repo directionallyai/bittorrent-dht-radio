@@ -3,8 +3,8 @@
 //! A direct message lives in its own BEP 44 slot under the sender's usual feed key, with a salt
 //! derived from the recipient's SSH key ([`slot_salt`]), so it never replaces the sender's
 //! broadcast and every recipient has a separate slot. The item is an ordinary signed radio item
-//! whose payload carries a `to:` header (the recipient's SSH fingerprint) and, as message text,
-//! `base64(E || ChaCha20-Poly1305(plaintext))`:
+//! whose payload carries a `to:` header (the recipient's SSH fingerprint) and, as its binary
+//! body, `E || ChaCha20-Poly1305(plaintext)`:
 //!
 //! * the recipient's Ed25519 SSH key is mapped to X25519 (the same conversion `age` uses for
 //!   `ssh-ed25519` recipients);
@@ -15,7 +15,6 @@
 //!
 //! Decrypting needs the recipient's private key *file*: ssh-agent can sign but cannot do X25519.
 
-use base64ct::{Base64, Encoding};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload as AeadPayload};
 use chacha20poly1305::ChaCha20Poly1305;
 use curve25519_dalek::MontgomeryPoint;
@@ -28,15 +27,13 @@ const KDF_INFO: &[u8] = b"bittorrent-dht-radio direct/1";
 const SALT_DOMAIN: &[u8] = b"radio-direct-slot/1\n";
 const EPHEMERAL_LEN: usize = 32;
 const TAG_LEN: usize = 16;
-/// Bytes added to the plaintext before base64: ephemeral key and AEAD tag.
+/// Bytes added to the plaintext: ephemeral key and AEAD tag.
 pub const OVERHEAD: usize = EPHEMERAL_LEN + TAG_LEN;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DirectError {
     #[error("recipient key is not a usable Ed25519 key: {0}")]
     BadRecipient(String),
-    #[error("the ciphertext is not valid base64")]
-    Encoding,
     #[error("ciphertext too short")]
     Truncated,
     #[error("decryption failed: not encrypted to this key, or modified")]
@@ -53,14 +50,9 @@ pub fn slot_salt(sender_salt: Option<&str>, recipient: &PublicKey) -> String {
     format!("dm1-{}", hex::encode(&h.finalize()[..16]))
 }
 
-/// Length of the base64 text that [`seal`] produces for a plaintext of `len` bytes.
+/// Length of what [`seal`] produces for a plaintext of `len` bytes.
 pub fn sealed_len(len: usize) -> usize {
-    (len + OVERHEAD).div_ceil(3) * 4
-}
-
-/// Largest plaintext whose sealed form fits in `text_room` bytes of message text.
-pub fn max_plaintext(text_room: usize) -> usize {
-    (text_room / 4 * 3).saturating_sub(OVERHEAD)
+    len + OVERHEAD
 }
 
 fn montgomery(key: &PublicKey) -> Result<MontgomeryPoint, DirectError> {
@@ -92,7 +84,11 @@ fn cipher(
 }
 
 /// Encrypt `plaintext` to `recipient`, binding it to `header` (the signed payload header).
-pub fn seal(recipient: &PublicKey, header: &[u8], plaintext: &[u8]) -> Result<String, DirectError> {
+pub fn seal(
+    recipient: &PublicKey,
+    header: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, DirectError> {
     let r = montgomery(recipient)?;
     let mut e = [0u8; 32];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut e);
@@ -114,7 +110,7 @@ pub fn seal(recipient: &PublicKey, header: &[u8], plaintext: &[u8]) -> Result<St
     let mut out = Vec::with_capacity(EPHEMERAL_LEN + ct.len());
     out.extend_from_slice(ephemeral.as_bytes());
     out.extend_from_slice(&ct);
-    Ok(Base64::encode_string(&out))
+    Ok(out)
 }
 
 /// The recipient's side: an X25519 secret derived from their Ed25519 SSH private key.
@@ -136,13 +132,12 @@ impl Opener {
         })
     }
 
-    /// Decrypt the base64 `body` produced by [`seal`] for the same `header`.
-    pub fn open(&self, header: &[u8], body: &str) -> Result<Vec<u8>, DirectError> {
-        let raw = Base64::decode_vec(body).map_err(|_| DirectError::Encoding)?;
-        if raw.len() < OVERHEAD {
+    /// Decrypt the `sealed` bytes produced by [`seal`] for the same `header`.
+    pub fn open(&self, header: &[u8], sealed: &[u8]) -> Result<Vec<u8>, DirectError> {
+        if sealed.len() < OVERHEAD {
             return Err(DirectError::Truncated);
         }
-        let (eph, ct) = raw.split_at(EPHEMERAL_LEN);
+        let (eph, ct) = sealed.split_at(EPHEMERAL_LEN);
         let eph = MontgomeryPoint(eph.try_into().expect("32 bytes"));
         let shared = eph.mul_clamped(self.scalar);
         if shared.as_bytes() == &[0u8; 32] {
@@ -197,18 +192,14 @@ mod tests {
         assert_eq!(eve.open(b"from: alice", &body), Err(DirectError::Decrypt));
         let bob = Opener::from_private_key(&bob).unwrap();
         assert_eq!(bob.open(b"from: mallory", &body), Err(DirectError::Decrypt));
-        let mut raw = Base64::decode_vec(&body).unwrap();
-        *raw.last_mut().unwrap() ^= 1;
+        let mut tampered = body.clone();
+        *tampered.last_mut().unwrap() ^= 1;
         assert_eq!(
-            bob.open(b"from: alice", &Base64::encode_string(&raw)),
+            bob.open(b"from: alice", &tampered),
             Err(DirectError::Decrypt)
         );
         assert_eq!(
-            bob.open(b"from: alice", "not base64!"),
-            Err(DirectError::Encoding)
-        );
-        assert_eq!(
-            bob.open(b"from: alice", "AAAA"),
+            bob.open(b"from: alice", &body[..OVERHEAD - 1]),
             Err(DirectError::Truncated)
         );
     }
@@ -221,14 +212,5 @@ mod tests {
         assert_eq!(s, slot_salt(None, bob.public_key()));
         assert_ne!(s, slot_salt(None, carol.public_key()));
         assert_ne!(s, slot_salt(Some("daily"), bob.public_key()));
-    }
-
-    #[test]
-    fn max_plaintext_inverts_sealed_len() {
-        for room in 64..700 {
-            let n = max_plaintext(room);
-            assert!(sealed_len(n) <= room, "room {room}");
-            assert!(sealed_len(n + 1) > room, "room {room}");
-        }
     }
 }

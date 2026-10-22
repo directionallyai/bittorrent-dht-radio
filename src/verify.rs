@@ -440,6 +440,7 @@ mod tests {
             expires_at: NOW + 60,
             prev: None,
             message: "x".into(),
+            sealed: Vec::new(),
         }
         .encode()
         .unwrap();

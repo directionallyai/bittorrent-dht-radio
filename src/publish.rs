@@ -74,6 +74,7 @@ impl Identity<'_> {
             expires_at: now.saturating_add(ttl_secs.max(1)),
             prev,
             message: message.to_string(),
+            sealed: Vec::new(),
         };
         self.sign_and_wrap(payload, self.salt.map(str::as_bytes))
     }
@@ -127,6 +128,7 @@ pub fn seal_payload(
         expires_at: now.saturating_add(ttl_secs.max(1)),
         prev: None,
         message: String::new(),
+        sealed: Vec::new(),
     };
     let header = payload.header()?;
     if item::predicted_raw_len(header.len() + direct::sealed_len(message.len())) > item::MAX_RAW_V {
@@ -135,7 +137,7 @@ pub fn seal_payload(
             max: max_direct_message_bytes(sender, to, seq, now, ttl_secs),
         });
     }
-    payload.message = direct::seal(to, &header, message.as_bytes())?;
+    payload.sealed = direct::seal(to, &header, message.as_bytes())?;
     Ok(payload)
 }
 
@@ -155,11 +157,12 @@ pub fn max_direct_message_bytes(
         expires_at: now + ttl_secs.max(1),
         prev: None,
         message: String::new(),
+        sealed: Vec::new(),
     }
     .header()
     .map(|h| h.len())
     .unwrap_or(0);
-    direct::max_plaintext(item::MAX_RAW_V.saturating_sub(2 + item::ed25519_sshsig_len() + header))
+    item::MAX_RAW_V.saturating_sub(2 + item::ed25519_sshsig_len() + header + direct::OVERHEAD)
 }
 
 /// Next sequence number for the feed: strictly above everything known, and never below the
@@ -185,6 +188,7 @@ pub fn max_message_bytes(
         expires_at: now + ttl_secs.max(1),
         prev: with_prev.then(|| "0".repeat(crate::payload::PREV_HEX_LEN)),
         message: "x".into(),
+        sealed: Vec::new(),
     };
     let header = one_byte.encode().map(|b| b.len() - 1).unwrap_or(0);
     item::MAX_RAW_V.saturating_sub(2 + item::ed25519_sshsig_len() + header)
@@ -339,13 +343,14 @@ mod tests {
             p.to.as_deref(),
             Some(&*sshsig::fingerprint(bob.ssh.public()))
         );
-        assert!(!p.message.contains("psst"));
+        assert!(p.message.is_empty());
+        assert!(!p.sealed.windows(4).any(|w| w == b"psst"));
         let Signer::File { key, .. } = &bob.ssh else {
             unreachable!()
         };
         let opener = direct::Opener::from_private_key(key).unwrap();
         assert_eq!(
-            opener.open(&p.header().unwrap(), &p.message).unwrap(),
+            opener.open(&p.header().unwrap(), &p.sealed).unwrap(),
             b"psst"
         );
     }
@@ -355,7 +360,7 @@ mod tests {
         let (alice, bob) = (Keys::new("alice"), Keys::new("bob"));
         let (seq, now, ttl) = (1_700_000_000i64, 1_700_000_000u64, 3600u64);
         let max = max_direct_message_bytes("alice", bob.ssh.public(), seq, now, ttl);
-        assert!(max > 400, "room for real messages: {max}");
+        assert!(max > 600, "room for real messages: {max}");
         let ok = alice
             .identity()
             .build_direct(bob.ssh.public(), &"a".repeat(max), seq, now, ttl)

@@ -267,14 +267,15 @@ output: `… alice -> you: text (direct, …)`). Nobody else can read it.
   `to: SHA256:<recipient SSH fingerprint>` between `from:` and `seq:`. All the checks in the table
   above apply, plus `recipient-mismatch` (a `to:` that is not you, or a `to:` in a broadcast slot)
   and `decrypt-failed` (signed by the pinned key, but it does not decrypt for you).
-* **Encrypted to the SSH key.** The message text is `base64(E ‖ ChaCha20-Poly1305(text))`. The
+* **Encrypted to the SSH key.** The body after the header is the raw bytes
+  `E ‖ ChaCha20-Poly1305(text)`, not text (the only payloads that are not all UTF-8). The
   recipient's Ed25519 SSH key is converted to X25519 (as `age` does for `ssh-ed25519`
   recipients), `E` is a fresh ephemeral X25519 key, and key and nonce come from HKDF-SHA256 over
   the shared secret (salt `E ‖ recipient`, info `bittorrent-dht-radio direct/1`). The associated
   data is the signed header (`from`, `to`, `seq`, `iat`, `exp`), so nobody can lift the ciphertext
   into an item signed by someone else.
-* **Size.** Encryption and base64 leave about 450 bytes for the text (exit 4 with the exact limit,
-  checked before signing).
+* **Size.** Encryption adds 48 bytes and the `to:` line about 55, leaving about 610 bytes for the
+  text (exit 4 with the exact limit, checked before signing).
 * **Decrypting needs the private key file.** ssh-agent can sign but cannot do the X25519 step. With
   `--ssh-agent` you can still send direct messages, but received ones are reported as
   `error: direct message from alice: … cannot be decrypted` and stay pending. An encrypted key file

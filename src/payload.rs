@@ -9,7 +9,7 @@
 //! exp: 1761145600
 //! prev: 0123456789abcdef      (optional)
 //!
-//! free-form message text
+//! free-form message text      (direct messages: the raw ciphertext bytes instead)
 //! ```
 //!
 //! Decoding is strict: the bytes must be exactly what [`Payload::encode`] would produce, so a
@@ -31,7 +31,8 @@ pub const FINGERPRINT_LEN: usize = 7 + 43;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
     pub sender: String,
-    /// Direct messages only: the recipient's SSH fingerprint. `message` is then the ciphertext.
+    /// Direct messages only: the recipient's SSH fingerprint. The body is then `sealed`, and
+    /// `message` is empty.
     pub to: Option<String>,
     /// Must equal the BEP 44 `seq` of the item carrying this payload.
     pub seq: i64,
@@ -42,6 +43,8 @@ pub struct Payload {
     /// Short hash of the previous payload from the same sender (optional chaining).
     pub prev: Option<String>,
     pub message: String,
+    /// Direct messages only: the ciphertext (binary, not text), see [`crate::direct`].
+    pub sealed: Vec<u8>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -101,7 +104,27 @@ pub fn validate_message(message: &str) -> Result<(), PayloadError> {
 impl Payload {
     pub fn validate(&self) -> Result<(), PayloadError> {
         self.validate_header()?;
-        validate_message(&self.message)
+        self.validate_body()
+    }
+
+    fn validate_body(&self) -> Result<(), PayloadError> {
+        if self.to.is_none() {
+            if !self.sealed.is_empty() {
+                return Err(PayloadError::Malformed(
+                    "only a direct message has a sealed body",
+                ));
+            }
+            return validate_message(&self.message);
+        }
+        if !self.message.is_empty() {
+            return Err(PayloadError::Malformed(
+                "a direct message's text must be sealed",
+            ));
+        }
+        if self.sealed.is_empty() {
+            return Err(PayloadError::EmptyMessage);
+        }
+        Ok(())
     }
 
     fn validate_header(&self) -> Result<(), PayloadError> {
@@ -133,9 +156,10 @@ impl Payload {
 
     /// Canonical encoding (the bytes that get signed).
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
-        validate_message(&self.message)?;
+        self.validate_body()?;
         let mut bytes = self.header()?;
         bytes.extend_from_slice(self.message.as_bytes());
+        bytes.extend_from_slice(&self.sealed);
         Ok(bytes)
     }
 
@@ -160,10 +184,13 @@ impl Payload {
 
     /// Strict decoding; rejects anything that is not byte-for-byte canonical.
     pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
-        let text = std::str::from_utf8(bytes).map_err(|_| PayloadError::NotUtf8)?;
-        let (head, message) = text
-            .split_once("\n\n")
-            .ok_or(PayloadError::Malformed("missing blank line before message"))?;
+        // The header is text and never contains a blank line; a direct message's body is binary.
+        let Some(split) = bytes.windows(2).position(|w| w == b"\n\n") else {
+            std::str::from_utf8(bytes).map_err(|_| PayloadError::NotUtf8)?;
+            return Err(PayloadError::Malformed("missing blank line before message"));
+        };
+        let head = std::str::from_utf8(&bytes[..split]).map_err(|_| PayloadError::NotUtf8)?;
+        let body = &bytes[split + 2..];
         let mut lines = head.split('\n').peekable();
         let version = lines.next().unwrap_or_default();
         if version != PROTOCOL {
@@ -192,6 +219,12 @@ impl Payload {
         if lines.next().is_some() {
             return Err(PayloadError::Malformed("unexpected extra header line"));
         }
+        let (message, sealed) = if to.is_some() {
+            (String::new(), body.to_vec())
+        } else {
+            let text = std::str::from_utf8(body).map_err(|_| PayloadError::NotUtf8)?;
+            (text.to_string(), Vec::new())
+        };
         let payload = Payload {
             sender,
             to,
@@ -199,7 +232,8 @@ impl Payload {
             issued_at,
             expires_at,
             prev,
-            message: message.to_string(),
+            message,
+            sealed,
         };
         // Canonical form check (rejects leading zeros, '+', non-canonical spacing, ...).
         if payload.encode()? != bytes {
@@ -243,6 +277,7 @@ mod tests {
             expires_at: 1_700_003_600,
             prev: Some("0123456789abcdef".into()),
             message: "hello\nworld \u{1F4E1}".into(),
+            sealed: Vec::new(),
         }
     }
 
@@ -267,21 +302,31 @@ mod tests {
     fn recipient_header_roundtrips_and_is_validated() {
         let mut p = sample();
         p.to = Some(format!("SHA256:{}", "A".repeat(43)));
+        p.message = String::new();
+        // Binary body, including bytes that are not UTF-8 and a blank-line lookalike.
+        p.sealed = vec![0xff, b'\n', b'\n', 0x00, 0x1b, 0xfe];
         let bytes = p.encode().unwrap();
-        let text = String::from_utf8(bytes.clone()).unwrap();
-        assert!(
-            text.starts_with("radio/1\nfrom: alice\nto: SHA256:AAAA"),
-            "{text}"
-        );
+        let header = p.header().unwrap();
+        assert!(header.starts_with(b"radio/1\nfrom: alice\nto: SHA256:AAAA"));
+        assert_eq!(bytes, [&header[..], &p.sealed[..]].concat());
         assert_eq!(Payload::decode(&bytes).unwrap(), p);
-        assert!(bytes.starts_with(&p.header().unwrap()));
-        assert_eq!(p.header().unwrap().len() + p.message.len(), bytes.len());
         // A `to:` line after seq is out of order.
-        let moved = text.replace(
-            &format!("to: SHA256:{}\nseq: 7\n", "A".repeat(43)),
-            &format!("seq: 7\nto: SHA256:{}\n", "A".repeat(43)),
-        );
-        assert!(Payload::decode(moved.as_bytes()).is_err());
+        let to_line = format!("to: SHA256:{}\n", "A".repeat(43));
+        let moved = String::from_utf8(header.clone())
+            .unwrap()
+            .replace(&to_line, "")
+            .replace("seq: 7\n", &format!("seq: 7\n{to_line}"));
+        assert!(Payload::decode(&[moved.as_bytes(), &p.sealed[..]].concat()).is_err());
+        // Without `to:` the body must be text; with it, the text must be sealed.
+        let mut broadcast = p.clone();
+        broadcast.to = None;
+        assert!(broadcast.encode().is_err());
+        let mut plain = p.clone();
+        plain.message = "visible".into();
+        assert!(plain.encode().is_err());
+        p.sealed.clear();
+        assert_eq!(p.encode(), Err(PayloadError::EmptyMessage));
+        p.sealed = vec![1];
         p.to = Some("SHA256:short".into());
         assert_eq!(p.encode(), Err(PayloadError::BadRecipient));
     }

@@ -394,11 +394,11 @@ fn publish_to_checks_the_recipient_and_size_before_signing() {
         "--publish-to",
         "bob",
         "--message",
-        &"x".repeat(600),
+        &"x".repeat(700),
     ]);
     assert_eq!(out.code, exit::BAD_MESSAGE, "{out:?}");
     assert!(
-        out.stderr.contains("direct message is 600 bytes"),
+        out.stderr.contains("direct message is 700 bytes"),
         "{out:?}"
     );
 }

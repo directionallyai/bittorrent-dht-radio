@@ -234,6 +234,7 @@ fn rejections_over_a_real_dht_have_specific_diagnostics_and_exit_12() {
             expires_at: now + 600,
             prev: None,
             message: "forged".into(),
+            sealed: Vec::new(),
         };
         let bytes = payload.encode().unwrap();
         let value = match case {

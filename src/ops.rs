@@ -21,6 +21,31 @@ use crate::verify::{self, Accepted, Fetched, Reject, Seen, Verdict};
 /// Maximum automatic re-sign attempts after a BEP 44 write conflict.
 const MAX_CONFLICT_RETRIES: usize = 2;
 
+/// A put acknowledged by fewer storage nodes than this is repeated (idempotently): a freshly
+/// bootstrapped client on the public DHT sometimes reaches only a few nodes on the first try.
+pub const MIN_STORED_NODES: u32 = 3;
+const PUT_TOP_UP_ATTEMPTS: usize = 2;
+
+/// Put an item; if few nodes acknowledged, repeat the identical put (same seq and value, no CAS)
+/// a couple of times and report the best result.
+fn put_resilient(
+    net: &Net,
+    item: mainline::MutableItem,
+    cas: Option<i64>,
+) -> Result<u32, PutFailure> {
+    let mut best = net.put(item.clone(), cas)?;
+    for _ in 0..PUT_TOP_UP_ATTEMPTS {
+        if best >= MIN_STORED_NODES {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        if let Ok(n) = net.put(item.clone(), None) {
+            best = best.max(n);
+        }
+    }
+    Ok(best)
+}
+
 pub struct Publisher<'a> {
     pub cfg: &'a Config,
     pub ssh: &'a Signer,
@@ -79,7 +104,12 @@ fn record_put(store: &Store, rec: PutRecord, item: Option<SignedItem>, republish
 
 impl Publisher<'_> {
     fn identity(&self) -> Identity<'_> {
-        Identity { name: &self.cfg.name, salt: self.cfg.salt.as_deref(), ssh: self.ssh, dht: self.dht_key }
+        Identity {
+            name: &self.cfg.name,
+            salt: self.cfg.salt.as_deref(),
+            ssh: self.ssh,
+            dht: self.dht_key,
+        }
     }
 
     /// Sign `message` with a new seq and issued-at, then put it. The size limit is checked
@@ -95,19 +125,36 @@ impl Publisher<'_> {
         let state = self.store.load().code(exit::ERROR)?;
         let local_last = state.publisher.last_item.as_ref().map(|i| i.seq);
         let prev = if chain_prev {
-            state.publisher.last_item.as_ref().map(|i| i.payload_sha256[..crate::payload::PREV_HEX_LEN].to_string())
+            state
+                .publisher
+                .last_item
+                .as_ref()
+                .map(|i| i.payload_sha256[..crate::payload::PREV_HEX_LEN].to_string())
         } else {
             None
         };
 
         // Fail fast on bad or oversized messages, before touching the network or the signer.
         let ident = self.identity();
-        preflight(ident.name, message, publish::next_seq(local_last, now), now, ttl_secs, prev.is_some())
-            .map_err(|e: BuildError| Coded { code: e.exit_code(), error: e.into() })?;
+        preflight(
+            ident.name,
+            message,
+            publish::next_seq(local_last, now),
+            now,
+            ttl_secs,
+            prev.is_some(),
+        )
+        .map_err(|e: BuildError| Coded {
+            code: e.exit_code(),
+            error: e.into(),
+        })?;
 
         // Learn the highest seq already on the DHT so ours is above it (state may have been lost).
         let own_key = self.dht_key.verifying_key().to_bytes();
-        let on_dht = net.get_latest(&own_key, self.cfg.salt.as_deref().map(str::as_bytes)).item.map(|i| i.seq());
+        let on_dht = net
+            .get_latest(&own_key, self.cfg.salt.as_deref().map(str::as_bytes))
+            .item
+            .map(|i| i.seq());
         let mut known_max = match (local_last, on_dht) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -119,13 +166,24 @@ impl Publisher<'_> {
             let seq = publish::next_seq(known_max, now);
             let built = ident
                 .build(message, seq, now, ttl_secs, prev.clone())
-                .map_err(|e: BuildError| Coded { code: e.exit_code(), error: e.into() })?;
-            match net.put(built.item.clone(), cas) {
+                .map_err(|e: BuildError| Coded {
+                    code: e.exit_code(),
+                    error: e.into(),
+                })?;
+            match put_resilient(net, built.item.clone(), cas) {
                 Ok(stored_at) => {
                     let bytes = bencoded_len(built.value.len());
                     let sha = hex::encode(built.payload.hash());
-                    record_put(self.store, 
-                        PutRecord { at: now, kind: "publish".into(), seq, ok: true, stored_at: Some(stored_at), error: None },
+                    record_put(
+                        self.store,
+                        PutRecord {
+                            at: now,
+                            kind: "publish".into(),
+                            seq,
+                            ok: true,
+                            stored_at: Some(stored_at),
+                            error: None,
+                        },
                         Some(SignedItem {
                             seq,
                             value_hex: hex::encode(&built.value),
@@ -148,14 +206,25 @@ impl Publisher<'_> {
                 }
                 Err(PutFailure::Conflict(c)) => {
                     // Someone (or a stale replica) holds a different seq: re-read and go above it.
-                    let latest = net.get_latest(&own_key, self.cfg.salt.as_deref().map(str::as_bytes)).item.map(|i| i.seq());
+                    let latest = net
+                        .get_latest(&own_key, self.cfg.salt.as_deref().map(str::as_bytes))
+                        .item
+                        .map(|i| i.seq());
                     known_max = known_max.max(latest);
                     cas = latest;
                     last_err = Some(PutFailure::Conflict(c));
                 }
                 Err(e) => {
-                    record_put(self.store, 
-                        PutRecord { at: now, kind: "publish".into(), seq, ok: false, stored_at: None, error: Some(e.to_string()) },
+                    record_put(
+                        self.store,
+                        PutRecord {
+                            at: now,
+                            kind: "publish".into(),
+                            seq,
+                            ok: false,
+                            stored_at: None,
+                            error: Some(e.to_string()),
+                        },
                         None,
                         false,
                     );
@@ -164,8 +233,16 @@ impl Publisher<'_> {
             }
         }
         let e = last_err.expect("loop ran at least once");
-        record_put(self.store, 
-            PutRecord { at: now, kind: "publish".into(), seq: 0, ok: false, stored_at: None, error: Some(e.to_string()) },
+        record_put(
+            self.store,
+            PutRecord {
+                at: now,
+                kind: "publish".into(),
+                seq: 0,
+                ok: false,
+                stored_at: None,
+                error: Some(e.to_string()),
+            },
             None,
             false,
         );
@@ -176,12 +253,19 @@ impl Publisher<'_> {
 /// Re-put the last signed item byte-for-byte. The signed `issued-at`/`expires-at` and `seq`
 /// do not change, so this keeps the DHT record alive but proves nothing about the sender
 /// being online now.
-pub fn republish(store: &Store, dht_key: &SigningKey, net: &Net, now: u64) -> Result<PublishReport, Coded> {
+pub fn republish(
+    store: &Store,
+    dht_key: &SigningKey,
+    net: &Net,
+    now: u64,
+) -> Result<PublishReport, Coded> {
     let state = store.load().code(exit::ERROR)?;
-    let item = state
-        .publisher
-        .last_item
-        .ok_or_else(|| coded(exit::STALE_ITEM, "nothing to republish: no message has been published from this config dir yet"))?;
+    let item = state.publisher.last_item.ok_or_else(|| {
+        coded(
+            exit::STALE_ITEM,
+            "nothing to republish: no message has been published from this config dir yet",
+        )
+    })?;
     if now >= item.expires_at {
         return Err(coded(
             exit::STALE_ITEM,
@@ -193,13 +277,27 @@ pub fn republish(store: &Store, dht_key: &SigningKey, net: &Net, now: u64) -> Re
             ),
         ));
     }
-    let value = hex::decode(&item.value_hex).map_err(|e| coded(exit::ERROR, format!("corrupt state: {e}")))?;
+    let value = hex::decode(&item.value_hex)
+        .map_err(|e| coded(exit::ERROR, format!("corrupt state: {e}")))?;
     // Ed25519 is deterministic, so re-signing the same (seq, v) reproduces the identical item.
-    let mi = mainline::MutableItem::new(dht_key.clone(), &value, item.seq, item.salt.as_deref().map(str::as_bytes));
-    match net.put(mi, None) {
+    let mi = mainline::MutableItem::new(
+        dht_key.clone(),
+        &value,
+        item.seq,
+        item.salt.as_deref().map(str::as_bytes),
+    );
+    match put_resilient(net, mi, None) {
         Ok(stored_at) => {
-            record_put(store, 
-                PutRecord { at: now, kind: "republish".into(), seq: item.seq, ok: true, stored_at: Some(stored_at), error: None },
+            record_put(
+                store,
+                PutRecord {
+                    at: now,
+                    kind: "republish".into(),
+                    seq: item.seq,
+                    ok: true,
+                    stored_at: Some(stored_at),
+                    error: None,
+                },
                 Some(item.clone()),
                 true,
             );
@@ -213,8 +311,16 @@ pub fn republish(store: &Store, dht_key: &SigningKey, net: &Net, now: u64) -> Re
             })
         }
         Err(e) => {
-            record_put(store, 
-                PutRecord { at: now, kind: "republish".into(), seq: item.seq, ok: false, stored_at: None, error: Some(e.to_string()) },
+            record_put(
+                store,
+                PutRecord {
+                    at: now,
+                    kind: "republish".into(),
+                    seq: item.seq,
+                    ok: false,
+                    stored_at: None,
+                    error: Some(e.to_string()),
+                },
                 None,
                 true,
             );
@@ -243,7 +349,10 @@ pub fn preflight_for(
         ttl_secs,
         chain_prev && last.is_some(),
     )
-    .map_err(|e| Coded { code: e.exit_code(), error: e.into() })
+    .map_err(|e| Coded {
+        code: e.exit_code(),
+        error: e.into(),
+    })
 }
 
 /// Validate and size-check a message without signing anything.
@@ -277,7 +386,10 @@ pub fn preflight(
 pub enum Fetch {
     Found(Fetched),
     /// The DHT answered but has no record for this feed.
-    NotFound { queried: u32, responded: u32 },
+    NotFound {
+        queried: u32,
+        responded: u32,
+    },
     /// No answer at all: DHT down, bootstrap failed, or every UDP request timed out.
     Unreachable(String),
 }
@@ -368,7 +480,10 @@ pub fn fetch_member(source: &Source, member: &Member) -> Fetch {
                     res.outcome.queried,
                     res.outcome.timed_out()
                 )),
-                None => Fetch::NotFound { queried: res.outcome.queried, responded: res.outcome.responded() },
+                None => Fetch::NotFound {
+                    queried: res.outcome.queried,
+                    responded: res.outcome.responded(),
+                },
             }
         }
     }
@@ -388,22 +503,41 @@ pub fn poll_circle(
 ) -> Result<PollReport, Coded> {
     // Query all members concurrently; the DHT handle is shared.
     let fetches: Vec<Fetch> = std::thread::scope(|scope| {
-        let handles: Vec<_> = circle.members.iter().map(|m| scope.spawn(move || fetch_member(source, m))).collect();
+        let handles: Vec<_> = circle
+            .members
+            .iter()
+            .map(|m| scope.spawn(move || fetch_member(source, m)))
+            .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Fetch::Unreachable("poll thread panicked".into())))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Fetch::Unreachable("poll thread panicked".into()))
+            })
             .collect()
     });
 
     let mut events = Vec::new();
-    let mut summary = PollSummary { members: circle.members.len(), ..Default::default() };
+    let mut summary = PollSummary {
+        members: circle.members.len(),
+        ..Default::default()
+    };
     store
         .update(|state| {
             for (member, fetch) in circle.members.iter().zip(fetches) {
                 let key = member.dht_public_key.clone();
                 let prev = state.members.get(&key).cloned().unwrap_or_default();
                 let outcome = evaluate(member, &prev, fetch, now, skew);
-                apply_outcome(state, member, &prev, outcome, now, emit_all, &mut events, &mut summary);
+                apply_outcome(
+                    state,
+                    member,
+                    &prev,
+                    outcome,
+                    now,
+                    emit_all,
+                    &mut events,
+                    &mut summary,
+                );
             }
         })
         .code(exit::ERROR)?;
@@ -453,7 +587,10 @@ fn apply_outcome(
                 });
             }
             summary.ok += 1;
-            (MemberStatus::Ok, format!("seq {} valid until {}", p.seq, format_utc(p.expires_at)))
+            (
+                MemberStatus::Ok,
+                format!("seq {} valid until {}", p.seq, format_utc(p.expires_at)),
+            )
         }
         Outcome::NotFound { queried, responded } => {
             summary.not_found += 1;
@@ -464,18 +601,35 @@ fn apply_outcome(
         }
         Outcome::Unreachable(d) => {
             summary.unreachable += 1;
-            (MemberStatus::Unreachable, format!("freshness could not be verified: {d}"))
+            (
+                MemberStatus::Unreachable,
+                format!("freshness could not be verified: {d}"),
+            )
         }
         Outcome::Rejected(r) if r.is_soft() => {
             summary.expired += 1;
-            (MemberStatus::Expired, format!("newest record is stale: {r}; publisher likely offline"))
+            (
+                MemberStatus::Expired,
+                format!("newest record is stale: {r}; publisher likely offline"),
+            )
         }
         Outcome::Rejected(r) => {
             summary.rejected += 1;
-            let rej = Rejection { at: now, reason: r.code().into(), detail: r.to_string() };
-            let repeated = prev.last_rejection.as_ref().is_some_and(|p| p.reason == rej.reason && p.detail == rej.detail);
+            let rej = Rejection {
+                at: now,
+                reason: r.code().into(),
+                detail: r.to_string(),
+            };
+            let repeated = prev
+                .last_rejection
+                .as_ref()
+                .is_some_and(|p| p.reason == rej.reason && p.detail == rej.detail);
             if emit_all || !repeated {
-                events.push(Event::Rejected { member: name.clone(), reason: rej.reason.clone(), detail: rej.detail.clone() });
+                events.push(Event::Rejected {
+                    member: name.clone(),
+                    reason: rej.reason.clone(),
+                    detail: rej.detail.clone(),
+                });
             }
             ms.last_rejection = Some(rej);
             (MemberStatus::Rejected, r.to_string())
@@ -519,7 +673,9 @@ pub fn require_circle(circle: &Circle) -> Result<(), Coded> {
     if circle.members.is_empty() {
         return Err(Coded {
             code: exit::CONFIG,
-            error: anyhow!("the circle is empty: pin a member first (`radio circle add --card <file>`)"),
+            error: anyhow!(
+                "the circle is empty: pin a member first (`radio circle add --card <file>`)"
+            ),
         });
     }
     Ok(())
@@ -537,7 +693,9 @@ mod tests {
         let mut circle = Circle::default();
         circle.add(alice.member()).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(&crate::config::Paths { root: dir.path().to_path_buf() });
+        let store = Store::new(&crate::config::Paths {
+            root: dir.path().to_path_buf(),
+        });
         (alice, circle, dir, store)
     }
 
@@ -550,12 +708,28 @@ mod tests {
         // Single-member circle: emulate Source by evaluating directly.
         let member = &circle.members[0];
         let mut events = Vec::new();
-        let mut summary = PollSummary { members: 1, ..Default::default() };
+        let mut summary = PollSummary {
+            members: 1,
+            ..Default::default()
+        };
         store
             .update(|state| {
-                let prev = state.members.get(&member.dht_public_key).cloned().unwrap_or_default();
+                let prev = state
+                    .members
+                    .get(&member.dht_public_key)
+                    .cloned()
+                    .unwrap_or_default();
                 let outcome = evaluate(member, &prev, f, now, 120);
-                apply_outcome(state, member, &prev, outcome, now, emit_all, &mut events, &mut summary);
+                apply_outcome(
+                    state,
+                    member,
+                    &prev,
+                    outcome,
+                    now,
+                    emit_all,
+                    &mut events,
+                    &mut summary,
+                );
             })
             .unwrap();
         PollReport { events, summary }
@@ -571,65 +745,157 @@ mod tests {
         assert_eq!(r.summary.exit_code(), exit::OK);
 
         // "Restart": fresh Store on the same directory sees the persisted state.
-        let store2 = Store::new(&crate::config::Paths { root: dir.path().to_path_buf() });
+        let store2 = Store::new(&crate::config::Paths {
+            root: dir.path().to_path_buf(),
+        });
         let r = poll(&circle, &store2, Fetch::Found(f), NOW + 60, false);
         assert_eq!(r.summary.new, 0);
         assert!(r.events.is_empty(), "no duplicate output: {:?}", r.events);
         assert_eq!(r.summary.exit_code(), exit::NO_NEW);
         let st = store2.load().unwrap();
-        assert_eq!(st.members[&circle.members[0].dht_public_key].highest_seq, 10);
+        assert_eq!(
+            st.members[&circle.members[0].dht_public_key].highest_seq,
+            10
+        );
     }
 
     #[test]
     fn rollback_after_accepting_newer_is_a_hard_failure() {
         let (alice, circle, _d, store) = setup();
-        poll(&circle, &store, Fetch::Found(fetched(&alice, 10, NOW, 3600, "new")), NOW, false);
-        let r = poll(&circle, &store, Fetch::Found(fetched(&alice, 9, NOW, 3600, "old")), NOW + 1, false);
+        poll(
+            &circle,
+            &store,
+            Fetch::Found(fetched(&alice, 10, NOW, 3600, "new")),
+            NOW,
+            false,
+        );
+        let r = poll(
+            &circle,
+            &store,
+            Fetch::Found(fetched(&alice, 9, NOW, 3600, "old")),
+            NOW + 1,
+            false,
+        );
         assert_eq!(r.summary.rejected, 1);
         assert_eq!(r.summary.exit_code(), exit::VERIFY_FAILED);
-        assert!(matches!(&r.events[0], Event::Rejected { reason, .. } if reason == "replay-rollback"));
+        assert!(
+            matches!(&r.events[0], Event::Rejected { reason, .. } if reason == "replay-rollback")
+        );
         // Highest seq is not lowered by the rejected item.
-        assert_eq!(store.load().unwrap().members[&circle.members[0].dht_public_key].highest_seq, 10);
+        assert_eq!(
+            store.load().unwrap().members[&circle.members[0].dht_public_key].highest_seq,
+            10
+        );
     }
 
     #[test]
     fn unreachable_is_distinct_from_no_new_message() {
         let (alice, circle, _d, store) = setup();
-        poll(&circle, &store, Fetch::Found(fetched(&alice, 10, NOW, 3600, "x")), NOW, false);
-        let r = poll(&circle, &store, Fetch::Unreachable("no DHT node answered".into()), NOW + 60, true);
+        poll(
+            &circle,
+            &store,
+            Fetch::Found(fetched(&alice, 10, NOW, 3600, "x")),
+            NOW,
+            false,
+        );
+        let r = poll(
+            &circle,
+            &store,
+            Fetch::Unreachable("no DHT node answered".into()),
+            NOW + 60,
+            true,
+        );
         assert_eq!(r.summary.exit_code(), exit::DHT_UNAVAILABLE);
-        assert!(matches!(&r.events[0], Event::Status { status: MemberStatus::Unreachable, .. }));
+        assert!(matches!(
+            &r.events[0],
+            Event::Status {
+                status: MemberStatus::Unreachable,
+                ..
+            }
+        ));
         // The member's last verified time survives the outage.
         let st = store.load().unwrap();
-        assert_eq!(st.members[&circle.members[0].dht_public_key].last_verified_at, Some(NOW));
+        assert_eq!(
+            st.members[&circle.members[0].dht_public_key].last_verified_at,
+            Some(NOW)
+        );
     }
 
     #[test]
     fn publisher_offline_not_found_and_expired_are_warnings_with_no_new_exit() {
         let (alice, circle, _d, store) = setup();
-        let r = poll(&circle, &store, Fetch::NotFound { queried: 8, responded: 8 }, NOW, true);
+        let r = poll(
+            &circle,
+            &store,
+            Fetch::NotFound {
+                queried: 8,
+                responded: 8,
+            },
+            NOW,
+            true,
+        );
         assert_eq!(r.summary.exit_code(), exit::NO_NEW);
-        assert!(matches!(&r.events[0], Event::Status { status: MemberStatus::NotFound, .. }));
+        assert!(matches!(
+            &r.events[0],
+            Event::Status {
+                status: MemberStatus::NotFound,
+                ..
+            }
+        ));
 
         let stale = fetched(&alice, 11, NOW - 7200, 3600, "old news");
         let r = poll(&circle, &store, Fetch::Found(stale), NOW, true);
         assert_eq!(r.summary.expired, 1);
         assert_eq!(r.summary.exit_code(), exit::NO_NEW);
-        assert!(matches!(&r.events[0], Event::Status { status: MemberStatus::Expired, .. }));
+        assert!(matches!(
+            &r.events[0],
+            Event::Status {
+                status: MemberStatus::Expired,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn state_changes_are_announced_once_and_recovery_is_reported() {
         let (alice, circle, _d, store) = setup();
-        poll(&circle, &store, Fetch::Found(fetched(&alice, 10, NOW, 3600, "x")), NOW, false);
-        let r = poll(&circle, &store, Fetch::Unreachable("t".into()), NOW + 60, false);
+        poll(
+            &circle,
+            &store,
+            Fetch::Found(fetched(&alice, 10, NOW, 3600, "x")),
+            NOW,
+            false,
+        );
+        let r = poll(
+            &circle,
+            &store,
+            Fetch::Unreachable("t".into()),
+            NOW + 60,
+            false,
+        );
         assert_eq!(r.events.len(), 1);
-        let r = poll(&circle, &store, Fetch::Unreachable("t".into()), NOW + 120, false);
+        let r = poll(
+            &circle,
+            &store,
+            Fetch::Unreachable("t".into()),
+            NOW + 120,
+            false,
+        );
         assert!(r.events.is_empty(), "same state again is not re-announced");
-        let r = poll(&circle, &store, Fetch::Found(fetched(&alice, 10, NOW, 3600, "x")), NOW + 180, false);
+        let r = poll(
+            &circle,
+            &store,
+            Fetch::Found(fetched(&alice, 10, NOW, 3600, "x")),
+            NOW + 180,
+            false,
+        );
         assert!(matches!(
             &r.events[0],
-            Event::Status { status: MemberStatus::Ok, previous: Some(MemberStatus::Unreachable), .. }
+            Event::Status {
+                status: MemberStatus::Ok,
+                previous: Some(MemberStatus::Unreachable),
+                ..
+            }
         ));
     }
 
@@ -637,7 +903,10 @@ mod tests {
     fn repeated_identical_rejection_is_not_re_announced_in_follow_mode() {
         let (alice, circle, _d, store) = setup();
         let mallory = Keys::new("alice");
-        let bad = Fetched { key: alice.dht.verifying_key().to_bytes(), ..fetched(&mallory, 1, NOW, 60, "x") };
+        let bad = Fetched {
+            key: alice.dht.verifying_key().to_bytes(),
+            ..fetched(&mallory, 1, NOW, 60, "x")
+        };
         let r = poll(&circle, &store, Fetch::Found(bad.clone()), NOW, false);
         assert_eq!(r.events.len(), 1);
         let r = poll(&circle, &store, Fetch::Found(bad.clone()), NOW + 1, false);
@@ -648,7 +917,13 @@ mod tests {
 
     #[test]
     fn exit_code_precedence() {
-        let s = |new, unreachable, rejected| PollSummary { new, unreachable, rejected, members: 3, ..Default::default() };
+        let s = |new, unreachable, rejected| PollSummary {
+            new,
+            unreachable,
+            rejected,
+            members: 3,
+            ..Default::default()
+        };
         assert_eq!(s(0, 0, 0).exit_code(), exit::NO_NEW);
         assert_eq!(s(1, 0, 0).exit_code(), exit::OK);
         assert_eq!(s(1, 1, 0).exit_code(), exit::OK);
@@ -660,7 +935,9 @@ mod tests {
     fn preflight_checks_size_before_signing() {
         assert!(preflight("alice", "ok", 1, 1000, 60, false).is_ok());
         assert_eq!(
-            preflight("alice", &"x".repeat(2000), 1, 1000, 60, false).unwrap_err().exit_code(),
+            preflight("alice", &"x".repeat(2000), 1, 1000, 60, false)
+                .unwrap_err()
+                .exit_code(),
             exit::BAD_MESSAGE
         );
         assert!(preflight("alice", "", 1, 1000, 60, false).is_err());

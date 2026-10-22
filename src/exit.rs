@@ -41,10 +41,16 @@ pub trait WithCode<T> {
 
 impl<T, E: Into<anyhow::Error>> WithCode<T> for Result<T, E> {
     fn code(self, code: i32) -> Result<T, Coded> {
-        self.map_err(|e| Coded { code, error: e.into() })
+        self.map_err(|e| Coded {
+            code,
+            error: e.into(),
+        })
     }
 }
 
 pub fn coded(code: i32, msg: impl std::fmt::Display) -> Coded {
-    Coded { code, error: anyhow::anyhow!("{msg}") }
+    Coded {
+        code,
+        error: anyhow::anyhow!("{msg}"),
+    }
 }

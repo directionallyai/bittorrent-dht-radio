@@ -38,7 +38,9 @@ pub enum SigFailure {
     #[error("wrong signature namespace {0:?} (expected {NAMESPACE:?})")]
     WrongNamespace(String),
     /// Valid SSHSIG, but made by a different SSH key than the one pinned for this feed owner.
-    #[error("feed-owner/SSH-signer mismatch: signed by {actual}, but this feed is pinned to {expected}")]
+    #[error(
+        "feed-owner/SSH-signer mismatch: signed by {actual}, but this feed is pinned to {expected}"
+    )]
     SignerMismatch { expected: String, actual: String },
     /// Structure fine and made by the pinned key, but the signature does not cover this payload.
     #[error("tampered payload: signature does not match the payload")]
@@ -47,8 +49,14 @@ pub enum SigFailure {
 
 /// Where SSH signatures come from.
 pub enum Signer {
-    File { key: Box<PrivateKey>, public: PublicKey },
-    Agent { socket: PathBuf, public: PublicKey },
+    File {
+        key: Box<PrivateKey>,
+        public: PublicKey,
+    },
+    Agent {
+        socket: PathBuf,
+        public: PublicKey,
+    },
 }
 
 impl Signer {
@@ -65,13 +73,16 @@ impl Signer {
                     path.display()
                 ))
             })?;
-            key = key
-                .decrypt(pass)
-                .map_err(|e| SignError::Key(format!("cannot decrypt SSH key {}: {e}", path.display())))?;
+            key = key.decrypt(pass).map_err(|e| {
+                SignError::Key(format!("cannot decrypt SSH key {}: {e}", path.display()))
+            })?;
         }
         let public = key.public_key().clone();
         ensure_supported(&public)?;
-        Ok(Signer::File { key: Box::new(key), public })
+        Ok(Signer::File {
+            key: Box::new(key),
+            public,
+        })
     }
 
     pub fn agent(socket: PathBuf, public: PublicKey) -> Result<Self, SignError> {
@@ -116,7 +127,10 @@ fn ensure_supported(public: &PublicKey) -> Result<(), SignError> {
 
 /// Is this key a FIDO2/security-key type that needs a touch?
 pub fn is_fido_key(public: &PublicKey) -> bool {
-    matches!(public.algorithm(), Algorithm::SkEd25519 | Algorithm::SkEcdsaSha2NistP256)
+    matches!(
+        public.algorithm(),
+        Algorithm::SkEd25519 | Algorithm::SkEcdsaSha2NistP256
+    )
 }
 
 fn agent_sign(socket: &Path, public: &PublicKey, msg: &[u8]) -> Result<SshSig, SignError> {
@@ -132,8 +146,13 @@ fn agent_sign(socket: &Path, public: &PublicKey, msg: &[u8]) -> Result<SshSig, S
             let signature = client
                 .sign(&public, &signed_data)
                 .map_err(|e| format!("agent refused to sign (is the key loaded?): {e}"))?;
-            SshSig::new(public.key_data().clone(), NAMESPACE, HashAlg::Sha512, signature)
-                .map_err(|e| e.to_string())
+            SshSig::new(
+                public.key_data().clone(),
+                NAMESPACE,
+                HashAlg::Sha512,
+                signature,
+            )
+            .map_err(|e| e.to_string())
         })();
         let _ = tx.send(result);
     });
@@ -146,8 +165,12 @@ fn agent_sign(socket: &Path, public: &PublicKey, msg: &[u8]) -> Result<SshSig, S
 
 /// List the public keys an ssh-agent currently holds.
 pub fn agent_identities(socket: &Path) -> Result<Vec<PublicKey>, SignError> {
-    let mut client = ssh_agent_client_rs::Client::connect(socket)
-        .map_err(|e| SignError::Agent(format!("cannot connect to agent at {}: {e}", socket.display())))?;
+    let mut client = ssh_agent_client_rs::Client::connect(socket).map_err(|e| {
+        SignError::Agent(format!(
+            "cannot connect to agent at {}: {e}",
+            socket.display()
+        ))
+    })?;
     let ids = client
         .list_all_identities()
         .map_err(|e| SignError::Agent(e.to_string()))?;
@@ -174,13 +197,15 @@ pub fn default_agent_socket() -> Option<PathBuf> {
 /// Binary SSHSIG blob (the PEM body, without armor).
 pub fn sig_to_blob(sig: &SshSig) -> Result<Vec<u8>, SignError> {
     let mut buf = Vec::new();
-    sig.encode(&mut buf).map_err(|e| SignError::SelfCheck(e.to_string()))?;
+    sig.encode(&mut buf)
+        .map_err(|e| SignError::SelfCheck(e.to_string()))?;
     Ok(buf)
 }
 
 pub fn sig_from_blob(blob: &[u8]) -> Result<SshSig, SigFailure> {
     let mut reader: &[u8] = blob;
-    let sig = SshSig::decode(&mut reader).map_err(|e| SigFailure::Bad(format!("not a valid SSHSIG: {e}")))?;
+    let sig = SshSig::decode(&mut reader)
+        .map_err(|e| SigFailure::Bad(format!("not a valid SSHSIG: {e}")))?;
     if !reader.is_empty() {
         return Err(SigFailure::Bad("trailing bytes after SSHSIG".into()));
     }
@@ -189,14 +214,17 @@ pub fn sig_from_blob(blob: &[u8]) -> Result<SshSig, SigFailure> {
 
 /// PEM-armored form, as accepted by `ssh-keygen -Y verify -s`.
 pub fn sig_to_pem(sig: &SshSig) -> Result<String, SignError> {
-    sig.to_pem(ssh_key::LineEnding::LF).map_err(|e| SignError::SelfCheck(e.to_string()))
+    sig.to_pem(ssh_key::LineEnding::LF)
+        .map_err(|e| SignError::SelfCheck(e.to_string()))
 }
 
 /// Verify `blob` as an SSHSIG over `payload` made by exactly `pinned`, in our namespace.
 pub fn verify_blob(pinned: &PublicKey, payload: &[u8], blob: &[u8]) -> Result<(), SigFailure> {
     let sig = sig_from_blob(blob)?;
     if sig.namespace() != NAMESPACE {
-        return Err(SigFailure::WrongNamespace(sig.namespace().chars().take(80).collect()));
+        return Err(SigFailure::WrongNamespace(
+            sig.namespace().chars().take(80).collect(),
+        ));
     }
     if !matches!(sig.hash_alg(), HashAlg::Sha512 | HashAlg::Sha256) {
         return Err(SigFailure::Bad("unsupported hash algorithm".into()));
@@ -208,20 +236,27 @@ pub fn verify_blob(pinned: &PublicKey, payload: &[u8], blob: &[u8]) -> Result<()
         )));
     }
     if sig.public_key() != pinned.key_data() {
-        let actual = PublicKey::from(sig.public_key().clone()).fingerprint(HashAlg::Sha256).to_string();
+        let actual = PublicKey::from(sig.public_key().clone())
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         return Err(SigFailure::SignerMismatch {
             expected: pinned.fingerprint(HashAlg::Sha256).to_string(),
             actual,
         });
     }
-    pinned.verify(NAMESPACE, payload, &sig).map_err(|_| SigFailure::Tampered)
+    pinned
+        .verify(NAMESPACE, payload, &sig)
+        .map_err(|_| SigFailure::Tampered)
 }
 
 /// Canonical OpenSSH text of a public key without its comment (what circle cards carry).
 pub fn public_key_text(key: &PublicKey) -> String {
     let mut k = key.clone();
     k.set_comment("");
-    k.to_openssh().expect("encodable public key").trim().to_string()
+    k.to_openssh()
+        .expect("encodable public key")
+        .trim()
+        .to_string()
 }
 
 pub fn parse_public_key(text: &str) -> Result<PublicKey, String> {
@@ -244,7 +279,10 @@ mod tests {
 
     fn signer(key: PrivateKey) -> Signer {
         let public = key.public_key().clone();
-        Signer::File { key: Box::new(key), public }
+        Signer::File {
+            key: Box::new(key),
+            public,
+        }
     }
 
     #[test]
@@ -260,7 +298,10 @@ mod tests {
     fn tampered_payload_is_detected() {
         let s = signer(test_key());
         let blob = sig_to_blob(&s.sign(b"hello radio").unwrap()).unwrap();
-        assert_eq!(verify_blob(s.public(), b"hello radiO", &blob), Err(SigFailure::Tampered));
+        assert_eq!(
+            verify_blob(s.public(), b"hello radiO", &blob),
+            Err(SigFailure::Tampered)
+        );
     }
 
     #[test]
@@ -269,18 +310,32 @@ mod tests {
         let mut blob = sig_to_blob(&s.sign(b"m").unwrap()).unwrap();
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
-        assert_eq!(verify_blob(s.public(), b"m", &blob), Err(SigFailure::Tampered));
-        assert!(matches!(verify_blob(s.public(), b"m", &blob[..40]), Err(SigFailure::Bad(_))));
-        assert!(matches!(verify_blob(s.public(), b"m", b"garbage"), Err(SigFailure::Bad(_))));
+        assert_eq!(
+            verify_blob(s.public(), b"m", &blob),
+            Err(SigFailure::Tampered)
+        );
+        assert!(matches!(
+            verify_blob(s.public(), b"m", &blob[..40]),
+            Err(SigFailure::Bad(_))
+        ));
+        assert!(matches!(
+            verify_blob(s.public(), b"m", b"garbage"),
+            Err(SigFailure::Bad(_))
+        ));
         let mut extra = sig_to_blob(&s.sign(b"m").unwrap()).unwrap();
         extra.push(0);
-        assert!(matches!(verify_blob(s.public(), b"m", &extra), Err(SigFailure::Bad(_))));
+        assert!(matches!(
+            verify_blob(s.public(), b"m", &extra),
+            Err(SigFailure::Bad(_))
+        ));
     }
 
     #[test]
     fn wrong_namespace_is_detected() {
         let key = test_key();
-        let sig = key.sign("other-namespace@example.com", HashAlg::Sha512, b"m").unwrap();
+        let sig = key
+            .sign("other-namespace@example.com", HashAlg::Sha512, b"m")
+            .unwrap();
         let blob = sig_to_blob(&sig).unwrap();
         assert!(matches!(
             verify_blob(key.public_key(), b"m", &blob),
@@ -298,11 +353,60 @@ mod tests {
         ));
     }
 
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |a, (i, b)| a | (*b as u32) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    fn sk_public_key() -> PublicKey {
+        let mut blob = Vec::new();
+        for field in [
+            &b"sk-ssh-ed25519@openssh.com"[..],
+            &[7u8; 32][..],
+            &b"ssh:"[..],
+        ] {
+            blob.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            blob.extend_from_slice(field);
+        }
+        PublicKey::from_openssh(&format!("sk-ssh-ed25519@openssh.com {}", b64(&blob))).unwrap()
+    }
+
     #[test]
-    fn rsa_style_or_sk_keys_are_refused_at_load_time() {
-        // sk keys cannot be generated here; the check is on the algorithm, covered by is_fido_key.
-        let key = test_key();
-        assert!(!is_fido_key(key.public_key()));
+    fn fido2_security_keys_are_detected_and_refused() {
+        let sk = sk_public_key();
+        assert!(is_fido_key(&sk));
+        let err = Signer::agent("/nonexistent".into(), sk)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("FIDO2") && err.contains("touch"), "{err}");
+        assert!(!is_fido_key(test_key().public_key()));
+    }
+
+    #[test]
+    fn non_ed25519_keys_are_refused_with_a_clear_message() {
+        // An ECDSA public key line (nistp256) from OpenSSH docs.
+        let ecdsa = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg= test";
+        let key = PublicKey::from_openssh(ecdsa).unwrap();
+        let err = Signer::agent("/nonexistent".into(), key)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("ssh-ed25519"), "{err}");
     }
 
     #[test]
@@ -311,6 +415,9 @@ mod tests {
         k.set_comment("alice@laptop");
         let text = public_key_text(k.public_key());
         assert!(!text.contains("alice@laptop"));
-        assert_eq!(parse_public_key(&text).unwrap().key_data(), k.public_key().key_data());
+        assert_eq!(
+            parse_public_key(&text).unwrap().key_data(),
+            k.public_key().key_data()
+        );
     }
 }

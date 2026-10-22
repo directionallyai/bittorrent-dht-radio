@@ -35,10 +35,18 @@ struct CardFile {
 }
 
 impl Member {
-    pub fn new(name: &str, ssh_public_key: &str, dht_public_key: &str, salt: Option<&str>) -> Result<Self> {
+    pub fn new(
+        name: &str,
+        ssh_public_key: &str,
+        dht_public_key: &str,
+        salt: Option<&str>,
+    ) -> Result<Self> {
         let ssh = sshsig::parse_public_key(ssh_public_key).map_err(|e| anyhow!(e))?;
         if ssh.algorithm() != ssh_key::Algorithm::Ed25519 {
-            bail!("SSH key type {} is not supported; radio v1 uses ssh-ed25519 keys", ssh.algorithm());
+            bail!(
+                "SSH key type {} is not supported; radio v1 uses ssh-ed25519 keys",
+                ssh.algorithm()
+            );
         }
         let m = Member {
             name: name.to_string(),
@@ -82,7 +90,9 @@ impl Member {
     }
 
     pub fn ssh_fingerprint(&self) -> String {
-        self.ssh_key().map(|k| sshsig::fingerprint(&k)).unwrap_or_else(|_| "invalid".into())
+        self.ssh_key()
+            .map(|k| sshsig::fingerprint(&k))
+            .unwrap_or_else(|_| "invalid".into())
     }
 
     /// `SHA256:`-style fingerprint of the DHT key, for out-of-band comparison.
@@ -112,7 +122,10 @@ impl Member {
 
     /// Human-readable card, also valid TOML.
     pub fn to_card(&self) -> String {
-        let file = CardFile { radio_card: CARD_VERSION, member: self.clone() };
+        let file = CardFile {
+            radio_card: CARD_VERSION,
+            member: self.clone(),
+        };
         format!(
             "# radio circle card - share this file; verify the fingerprints out of band before pinning it.\n\
              # card code:       {}\n\
@@ -123,6 +136,20 @@ impl Member {
             self.dht_fingerprint(),
             toml::to_string(&file).expect("card serialises")
         )
+    }
+
+    /// Parse a card from raw file bytes. Tolerates a UTF-8 BOM and UTF-16 (Windows PowerShell's
+    /// `>` redirection writes UTF-16 with a BOM).
+    pub fn from_card_bytes(bytes: &[u8]) -> Result<Self> {
+        let text = match bytes {
+            [0xff, 0xfe, rest @ ..] => decode_utf16(rest, u16::from_le_bytes)?,
+            [0xfe, 0xff, rest @ ..] => decode_utf16(rest, u16::from_be_bytes)?,
+            [0xef, 0xbb, 0xbf, rest @ ..] => {
+                String::from_utf8(rest.to_vec()).context("card is not valid UTF-8")?
+            }
+            _ => String::from_utf8(bytes.to_vec()).context("card is not valid UTF-8 text")?,
+        };
+        Self::from_card(&text)
     }
 
     pub fn from_card(text: &str) -> Result<Self> {
@@ -140,11 +167,19 @@ impl Member {
     }
 }
 
+fn decode_utf16(bytes: &[u8], conv: fn([u8; 2]) -> u16) -> Result<String> {
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| conv([c[0], c[1]])).collect();
+    String::from_utf16(&units).context("card is not valid UTF-16")
+}
+
 fn b64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |a, (i, b)| a | (*b as u32) << (16 - 8 * i));
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |a, (i, b)| a | (*b as u32) << (16 - 8 * i));
         let chars = chunk.len() + 1;
         for i in 0..chars {
             out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
@@ -163,9 +198,11 @@ impl Circle {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let c: Circle = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+                let c: Circle =
+                    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
                 for m in &c.members {
-                    m.validate().with_context(|| format!("invalid circle entry {:?}", m.name))?;
+                    m.validate()
+                        .with_context(|| format!("invalid circle entry {:?}", m.name))?;
                 }
                 Ok(c)
             }
@@ -205,9 +242,11 @@ impl Circle {
                 member.name
             );
         }
-        if let Some(other) = self.members.iter().find(|m| {
-            m.dht_public_key == member.dht_public_key && m.salt == member.salt
-        }) {
+        if let Some(other) = self
+            .members
+            .iter()
+            .find(|m| m.dht_public_key == member.dht_public_key && m.salt == member.salt)
+        {
             bail!("DHT feed key already pinned as {:?}", other.name);
         }
         self.members.push(member);
@@ -257,10 +296,27 @@ mod tests {
     }
 
     #[test]
+    fn card_survives_powershell_utf16_and_bom() {
+        let (m, _) = member("alice");
+        let text = m.to_card();
+        let mut utf16le = vec![0xff, 0xfe];
+        for u in text.encode_utf16() {
+            utf16le.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(Member::from_card_bytes(&utf16le).unwrap(), m);
+        let mut bom = vec![0xef, 0xbb, 0xbf];
+        bom.extend_from_slice(text.as_bytes());
+        assert_eq!(Member::from_card_bytes(&bom).unwrap(), m);
+        assert_eq!(Member::from_card_bytes(text.as_bytes()).unwrap(), m);
+    }
+
+    #[test]
     fn card_rejects_bad_input() {
         let (m, _) = member("alice");
         assert!(Member::from_card("garbage").is_err());
-        assert!(Member::from_card(&m.to_card().replace("radio_card = 1", "radio_card = 9")).is_err());
+        assert!(
+            Member::from_card(&m.to_card().replace("radio_card = 1", "radio_card = 9")).is_err()
+        );
         let bad = m.to_card().replace(&m.dht_public_key, &"ab".repeat(31));
         assert!(Member::from_card(&bad).is_err());
         assert!(Member::new("bad name", &m.ssh_public_key, &m.dht_public_key, None).is_err());
@@ -293,7 +349,10 @@ mod tests {
         let mut dup = member("carol").0;
         dup.dht_public_key = a.dht_public_key.clone();
         assert!(c.add(dup).is_err());
-        assert_eq!(c.find_by_dht_key(&b.dht_key().unwrap()).unwrap().name, "bob");
+        assert_eq!(
+            c.find_by_dht_key(&b.dht_key().unwrap()).unwrap().name,
+            "bob"
+        );
         c.remove("alice").unwrap();
         assert!(c.find("alice").is_none());
         assert!(c.remove("alice").is_err());
@@ -309,6 +368,9 @@ mod tests {
         c.save(&path).unwrap();
         let loaded = Circle::load(&path).unwrap();
         assert_eq!(loaded.members, c.members);
-        assert!(Circle::load(&dir.path().join("missing.toml")).unwrap().members.is_empty());
+        assert!(Circle::load(&dir.path().join("missing.toml"))
+            .unwrap()
+            .members
+            .is_empty());
     }
 }

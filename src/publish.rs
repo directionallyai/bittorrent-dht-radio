@@ -67,7 +67,11 @@ impl Identity<'_> {
         let blob = sshsig::sig_to_blob(&sig)?;
         let value = item::encode_value(&bytes, &blob)?;
         let item = MutableItem::new(self.dht.clone(), &value, seq, self.salt.map(str::as_bytes));
-        Ok(Built { payload, value, item })
+        Ok(Built {
+            payload,
+            value,
+            item,
+        })
     }
 }
 
@@ -79,26 +83,23 @@ pub fn next_seq(known_max: Option<i64>, now: u64) -> i64 {
 }
 
 /// Largest message (in bytes) that fits for the given sender name and header values.
-pub fn max_message_bytes(sender: &str, seq: i64, now: u64, ttl_secs: u64, with_prev: bool) -> usize {
-    let empty = Payload {
+pub fn max_message_bytes(
+    sender: &str,
+    seq: i64,
+    now: u64,
+    ttl_secs: u64,
+    with_prev: bool,
+) -> usize {
+    let one_byte = Payload {
         sender: sender.to_string(),
         seq,
         issued_at: now,
         expires_at: now + ttl_secs.max(1),
         prev: with_prev.then(|| "0".repeat(crate::payload::PREV_HEX_LEN)),
-        message: String::new(),
+        message: "x".into(),
     };
-    let header = empty.encode_unchecked_len();
+    let header = one_byte.encode().map(|b| b.len() - 1).unwrap_or(0);
     item::MAX_RAW_V.saturating_sub(2 + item::ed25519_sshsig_len() + header)
-}
-
-impl Payload {
-    /// Encoded length ignoring message validity (used only for capacity estimates).
-    fn encode_unchecked_len(&self) -> usize {
-        let mut p = self.clone();
-        p.message = "x".into();
-        p.encode().map(|b| b.len() - 1).unwrap_or(0)
-    }
 }
 
 #[cfg(test)]
@@ -120,13 +121,21 @@ pub(crate) mod testkit {
             rand_core::RngCore::fill_bytes(&mut OsRng, &mut seed);
             Keys {
                 name: name.into(),
-                ssh: Signer::File { key: Box::new(key), public },
+                ssh: Signer::File {
+                    key: Box::new(key),
+                    public,
+                },
                 dht: SigningKey::from_bytes(&seed),
             }
         }
 
         pub fn identity(&self) -> Identity<'_> {
-            Identity { name: &self.name, salt: None, ssh: &self.ssh, dht: &self.dht }
+            Identity {
+                name: &self.name,
+                salt: None,
+                ssh: &self.ssh,
+                dht: &self.dht,
+            }
         }
 
         pub fn member(&self) -> crate::circle::Member {
@@ -154,7 +163,10 @@ mod tests {
         assert_eq!(built.item.seq(), 5);
         assert_eq!(built.item.value(), &built.value[..]);
         let (payload, blob) = item::decode_value(&built.value).unwrap();
-        assert_eq!(crate::sshsig::verify_blob(k.ssh.public(), payload, blob), Ok(()));
+        assert_eq!(
+            crate::sshsig::verify_blob(k.ssh.public(), payload, blob),
+            Ok(())
+        );
         assert_eq!(Payload::decode(payload).unwrap(), built.payload);
     }
 
@@ -165,10 +177,21 @@ mod tests {
         let max = max_message_bytes("alice", seq, now, ttl, false);
         assert!(max > 600, "room for real messages: {max}");
 
-        let ok = k.identity().build(&"a".repeat(max), seq, now, ttl, None).unwrap();
-        assert_eq!(bencoded_len(ok.value.len()), MAX_V_BENCODED, "exactly 1000 bytes bencoded");
+        let ok = k
+            .identity()
+            .build(&"a".repeat(max), seq, now, ttl, None)
+            .unwrap();
+        assert_eq!(
+            bencoded_len(ok.value.len()),
+            MAX_V_BENCODED,
+            "exactly 1000 bytes bencoded"
+        );
 
-        let err = k.identity().build(&"a".repeat(max + 1), seq, now, ttl, None).err().unwrap();
+        let err = k
+            .identity()
+            .build(&"a".repeat(max + 1), seq, now, ttl, None)
+            .err()
+            .unwrap();
         assert_eq!(err.exit_code(), crate::exit::BAD_MESSAGE);
         let text = err.to_string();
         assert!(text.contains("1001 bytes bencoded"), "{text}");
@@ -183,8 +206,16 @@ mod tests {
             socket: "/nonexistent/agent.sock".into(),
             public: k.ssh.public().clone(),
         };
-        let id = Identity { name: "alice", salt: None, ssh: &agent, dht: &k.dht };
-        let err = id.build(&"x".repeat(5000), 1, 1000, 60, None).err().unwrap();
+        let id = Identity {
+            name: "alice",
+            salt: None,
+            ssh: &agent,
+            dht: &k.dht,
+        };
+        let err = id
+            .build(&"x".repeat(5000), 1, 1000, 60, None)
+            .err()
+            .unwrap();
         assert!(matches!(err, BuildError::Size(_)), "got {err}");
     }
 

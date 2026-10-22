@@ -31,7 +31,11 @@ pub enum Event {
         last_verified_at: Option<u64>,
     },
     /// A fetched record failed verification.
-    Rejected { member: String, reason: String, detail: String },
+    Rejected {
+        member: String,
+        reason: String,
+        detail: String,
+    },
     /// Our own publish / republish result.
     Published {
         kind: String,
@@ -54,7 +58,10 @@ pub struct Printer {
 
 impl Printer {
     pub fn new(json: bool) -> Self {
-        Printer { json, lock: Mutex::new(()) }
+        Printer {
+            json,
+            lock: Mutex::new(()),
+        }
     }
 
     pub fn is_json(&self) -> bool {
@@ -65,12 +72,23 @@ impl Printer {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.json {
             let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "{}", serde_json::to_string(event).expect("event serialises"));
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::to_string(event).expect("event serialises")
+            );
             let _ = out.flush();
             return;
         }
         match event {
-            Event::Message { member, seq, issued_at, expires_at, message, .. } => {
+            Event::Message {
+                member,
+                seq,
+                issued_at,
+                expires_at,
+                message,
+                ..
+            } => {
                 let msg = sanitize_for_terminal(message);
                 let meta = format!("seq {seq}, expires {}", format_utc(*expires_at));
                 let mut out = std::io::stdout().lock();
@@ -84,9 +102,20 @@ impl Printer {
                 }
                 let _ = out.flush();
             }
-            Event::Status { member, status, detail, previous, last_verified_at } => {
+            Event::Status {
+                member,
+                status,
+                detail,
+                previous,
+                last_verified_at,
+            } => {
                 let age = last_verified_at
-                    .map(|t| format!("; last verified message {} ago", format_age(now_secs().saturating_sub(t))))
+                    .map(|t| {
+                        format!(
+                            "; last verified message {} ago",
+                            format_age(now_secs().saturating_sub(t))
+                        )
+                    })
                     .unwrap_or_else(|| "; no verified message yet".into());
                 let line = match (status, previous) {
                     (MemberStatus::Ok, Some(prev)) if *prev != MemberStatus::Ok => {
@@ -97,11 +126,29 @@ impl Printer {
                 };
                 eprintln!("{line}");
             }
-            Event::Rejected { member, reason, detail } => {
-                eprintln!("REJECTED {member}: {reason}: {}", sanitize_for_terminal(detail));
+            Event::Rejected {
+                member,
+                reason,
+                detail,
+            } => {
+                eprintln!(
+                    "REJECTED {member}: {reason}: {}",
+                    sanitize_for_terminal(detail)
+                );
             }
-            Event::Published { kind, seq, issued_at, expires_at, stored_at, bytes_bencoded } => {
-                let note = if kind == "republished" { " [same signed item; timestamp unchanged]" } else { "" };
+            Event::Published {
+                kind,
+                seq,
+                issued_at,
+                expires_at,
+                stored_at,
+                bytes_bencoded,
+            } => {
+                let note = if kind == "republished" {
+                    " [same signed item; timestamp unchanged]"
+                } else {
+                    ""
+                };
                 println!(
                     "{kind}: seq {seq}, issued {}, expires {}, stored at {stored_at} DHT node(s), value {bytes_bencoded}/1000 bytes{note}",
                     format_utc(*issued_at),

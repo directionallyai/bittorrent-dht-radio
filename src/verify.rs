@@ -23,7 +23,12 @@ pub struct Fetched {
 
 impl From<&mainline::MutableItem> for Fetched {
     fn from(i: &mainline::MutableItem) -> Self {
-        Fetched { key: *i.key(), salt: i.salt().map(<[u8]>::to_vec), seq: i.seq(), value: i.value().to_vec() }
+        Fetched {
+            key: *i.key(),
+            salt: i.salt().map(<[u8]>::to_vec),
+            seq: i.seq(),
+            value: i.value().to_vec(),
+        }
     }
 }
 
@@ -39,7 +44,10 @@ pub enum Reject {
     #[error("unknown publisher {key}: not in the pinned circle")]
     UnknownPublisher { key: String },
     #[error("feed salt mismatch: pinned {expected:?}, item has {actual:?}")]
-    SaltMismatch { expected: Option<String>, actual: Option<String> },
+    SaltMismatch {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
     #[error("malformed value: {0}")]
     MalformedValue(String),
     #[error("bad signature: {0}")]
@@ -48,7 +56,9 @@ pub enum Reject {
     TamperedPayload,
     #[error("wrong signature namespace {0:?}")]
     WrongNamespace(String),
-    #[error("feed-owner/SSH-signer mismatch: signed by {actual}, but this feed is pinned to {expected}")]
+    #[error(
+        "feed-owner/SSH-signer mismatch: signed by {actual}, but this feed is pinned to {expected}"
+    )]
     SignerMismatch { expected: String, actual: String },
     #[error("malformed payload: {0}")]
     MalformedPayload(String),
@@ -57,13 +67,22 @@ pub enum Reject {
     #[error("seq mismatch: payload seq {payload} != BEP 44 seq {item}")]
     SeqMismatch { item: i64, payload: i64 },
     #[error("issued-at {issued_at} ({issued}) is {ahead}s in the future, beyond the allowed clock skew of {skew}s (check both clocks)")]
-    ClockSkew { issued_at: u64, issued: String, ahead: u64, skew: u64 },
+    ClockSkew {
+        issued_at: u64,
+        issued: String,
+        ahead: u64,
+        skew: u64,
+    },
     #[error("replay/rollback: seq {seq} is below the highest accepted seq {highest}")]
     Rollback { seq: i64, highest: i64 },
     #[error("seq {seq} was already accepted with different content (equivocation or replay)")]
     SeqReuse { seq: i64 },
     #[error("expired at {expires} ({ago}s ago)")]
-    Expired { expires_at: u64, expires: String, ago: u64 },
+    Expired {
+        expires_at: u64,
+        expires: String,
+        ago: u64,
+    },
 }
 
 impl Reject {
@@ -119,7 +138,9 @@ pub fn verify_item(
 ) -> Result<Verdict, Reject> {
     let member = circle
         .find_by_dht_key(&fetched.key)
-        .ok_or_else(|| Reject::UnknownPublisher { key: hex::encode(fetched.key) })?;
+        .ok_or_else(|| Reject::UnknownPublisher {
+            key: hex::encode(fetched.key),
+        })?;
     verify_for_member(member, seen, fetched, now, skew_secs)
 }
 
@@ -132,33 +153,49 @@ pub fn verify_for_member(
     skew_secs: u64,
 ) -> Result<Verdict, Reject> {
     if member.dht_key().ok() != Some(fetched.key) {
-        return Err(Reject::UnknownPublisher { key: hex::encode(fetched.key) });
+        return Err(Reject::UnknownPublisher {
+            key: hex::encode(fetched.key),
+        });
     }
     if member.salt.as_deref().map(str::as_bytes) != fetched.salt.as_deref() {
         return Err(Reject::SaltMismatch {
             expected: member.salt.clone(),
-            actual: fetched.salt.as_ref().map(|s| String::from_utf8_lossy(s).into_owned()),
+            actual: fetched
+                .salt
+                .as_ref()
+                .map(|s| String::from_utf8_lossy(s).into_owned()),
         });
     }
 
     let (payload_bytes, blob) =
         item::decode_value(&fetched.value).map_err(|e| Reject::MalformedValue(e.to_string()))?;
 
-    let pinned = member.ssh_key().map_err(|e| Reject::BadSignature(e.to_string()))?;
+    let pinned = member
+        .ssh_key()
+        .map_err(|e| Reject::BadSignature(e.to_string()))?;
     sshsig::verify_blob(&pinned, payload_bytes, blob).map_err(|f| match f {
         SigFailure::Bad(m) => Reject::BadSignature(m),
         SigFailure::WrongNamespace(ns) => Reject::WrongNamespace(ns),
-        SigFailure::SignerMismatch { expected, actual } => Reject::SignerMismatch { expected, actual },
+        SigFailure::SignerMismatch { expected, actual } => {
+            Reject::SignerMismatch { expected, actual }
+        }
         SigFailure::Tampered => Reject::TamperedPayload,
     })?;
 
     // From here on the payload is authentic: it was signed by the pinned SSH key.
-    let payload = Payload::decode(payload_bytes).map_err(|e| Reject::MalformedPayload(e.to_string()))?;
+    let payload =
+        Payload::decode(payload_bytes).map_err(|e| Reject::MalformedPayload(e.to_string()))?;
     if payload.sender != member.name {
-        return Err(Reject::SenderMismatch { expected: member.name.clone(), actual: payload.sender });
+        return Err(Reject::SenderMismatch {
+            expected: member.name.clone(),
+            actual: payload.sender,
+        });
     }
     if payload.seq != fetched.seq {
-        return Err(Reject::SeqMismatch { item: fetched.seq, payload: payload.seq });
+        return Err(Reject::SeqMismatch {
+            item: fetched.seq,
+            payload: payload.seq,
+        });
     }
     if payload.issued_at > now.saturating_add(skew_secs) {
         return Err(Reject::ClockSkew {
@@ -172,7 +209,10 @@ pub fn verify_for_member(
     let sha = hex::encode(payload.hash());
     let mut already_seen = false;
     if fetched.seq < seen.highest_seq {
-        return Err(Reject::Rollback { seq: fetched.seq, highest: seen.highest_seq });
+        return Err(Reject::Rollback {
+            seq: fetched.seq,
+            highest: seen.highest_seq,
+        });
     }
     if fetched.seq == seen.highest_seq {
         match &seen.payload_sha256 {
@@ -189,8 +229,16 @@ pub fn verify_for_member(
         });
     }
 
-    let accepted = Accepted { member: member.clone(), payload, payload_sha256: sha };
-    Ok(if already_seen { Verdict::Seen(accepted) } else { Verdict::New(accepted) })
+    let accepted = Accepted {
+        member: member.clone(),
+        payload,
+        payload_sha256: sha,
+    };
+    Ok(if already_seen {
+        Verdict::Seen(accepted)
+    } else {
+        Verdict::New(accepted)
+    })
 }
 
 #[cfg(test)]
@@ -224,7 +272,10 @@ mod tests {
     }
 
     fn good(s: &Setup, seq: i64, issued: u64, ttl: u64) -> Built {
-        s.alice.identity().build("hello", seq, issued, ttl, None).unwrap()
+        s.alice
+            .identity()
+            .build("hello", seq, issued, ttl, None)
+            .unwrap()
     }
 
     fn check(s: &Setup, seen: &Seen, f: &Fetched) -> Result<Verdict, Reject> {
@@ -249,8 +300,13 @@ mod tests {
         let s = setup();
         let b = good(&s, 10, NOW - 5, 3600);
         let f = fetched(&b, &s.alice);
-        let Verdict::New(a) = check(&s, &Seen::default(), &f).unwrap() else { panic!() };
-        let seen = Seen { highest_seq: 10, payload_sha256: Some(a.payload_sha256) };
+        let Verdict::New(a) = check(&s, &Seen::default(), &f).unwrap() else {
+            panic!()
+        };
+        let seen = Seen {
+            highest_seq: 10,
+            payload_sha256: Some(a.payload_sha256),
+        };
         assert!(matches!(check(&s, &seen, &f).unwrap(), Verdict::Seen(_)));
     }
 
@@ -273,10 +329,16 @@ mod tests {
         for byte in &mut f.value[2 + plen..] {
             *byte = 0x41;
         }
-        assert_eq!(check(&s, &Seen::default(), &f).unwrap_err().code(), "bad-signature");
+        assert_eq!(
+            check(&s, &Seen::default(), &f).unwrap_err().code(),
+            "bad-signature"
+        );
         // Truncated framing is a malformed value.
         f.value.truncate(1);
-        assert_eq!(check(&s, &Seen::default(), &f).unwrap_err().code(), "malformed-value");
+        assert_eq!(
+            check(&s, &Seen::default(), &f).unwrap_err().code(),
+            "malformed-value"
+        );
     }
 
     #[test]
@@ -286,7 +348,10 @@ mod tests {
         let mut f = fetched(&b, &s.alice);
         let idx = 2 + b.payload.encode().unwrap().len() - 1; // last message byte
         f.value[idx] ^= 0x01;
-        assert_eq!(check(&s, &Seen::default(), &f).unwrap_err().code(), "tampered-payload");
+        assert_eq!(
+            check(&s, &Seen::default(), &f).unwrap_err().code(),
+            "tampered-payload"
+        );
     }
 
     #[test]
@@ -294,9 +359,19 @@ mod tests {
         let s = setup();
         // Alice's DHT feed key, but the payload is signed by a different SSH key.
         let other_ssh = Keys::new("alice");
-        let id = Identity { name: "alice", salt: None, ssh: &other_ssh.ssh, dht: &s.alice.dht };
+        let id = Identity {
+            name: "alice",
+            salt: None,
+            ssh: &other_ssh.ssh,
+            dht: &s.alice.dht,
+        };
         let b = id.build("x", 4, NOW, 60, None).unwrap();
-        assert_eq!(check(&s, &Seen::default(), &fetched(&b, &s.alice)).unwrap_err().code(), "signer-mismatch");
+        assert_eq!(
+            check(&s, &Seen::default(), &fetched(&b, &s.alice))
+                .unwrap_err()
+                .code(),
+            "signer-mismatch"
+        );
     }
 
     #[test]
@@ -312,19 +387,45 @@ mod tests {
         }
         .encode()
         .unwrap();
-        let Signer::File { key, .. } = &s.alice.ssh else { unreachable!() };
-        let sig = key.sign("someone-else@example.com", ssh_key::HashAlg::Sha512, &payload).unwrap();
+        let Signer::File { key, .. } = &s.alice.ssh else {
+            unreachable!()
+        };
+        let sig = key
+            .sign(
+                "someone-else@example.com",
+                ssh_key::HashAlg::Sha512,
+                &payload,
+            )
+            .unwrap();
         let value = item::encode_value(&payload, &sshsig::sig_to_blob(&sig).unwrap()).unwrap();
-        let f = Fetched { key: s.alice.dht.verifying_key().to_bytes(), salt: None, seq: 4, value };
-        assert_eq!(check(&s, &Seen::default(), &f).unwrap_err().code(), "wrong-namespace");
+        let f = Fetched {
+            key: s.alice.dht.verifying_key().to_bytes(),
+            salt: None,
+            seq: 4,
+            value,
+        };
+        assert_eq!(
+            check(&s, &Seen::default(), &f).unwrap_err().code(),
+            "wrong-namespace"
+        );
     }
 
     #[test]
     fn sender_mismatch() {
         let s = setup();
-        let id = Identity { name: "bob", salt: None, ssh: &s.alice.ssh, dht: &s.alice.dht };
+        let id = Identity {
+            name: "bob",
+            salt: None,
+            ssh: &s.alice.ssh,
+            dht: &s.alice.dht,
+        };
         let b = id.build("x", 4, NOW, 60, None).unwrap();
-        assert_eq!(check(&s, &Seen::default(), &fetched(&b, &s.alice)).unwrap_err().code(), "sender-mismatch");
+        assert_eq!(
+            check(&s, &Seen::default(), &fetched(&b, &s.alice))
+                .unwrap_err()
+                .code(),
+            "sender-mismatch"
+        );
     }
 
     #[test]
@@ -333,7 +434,10 @@ mod tests {
         let b = good(&s, 4, NOW, 60);
         let mut f = fetched(&b, &s.alice);
         f.seq = 5;
-        assert_eq!(check(&s, &Seen::default(), &f).unwrap_err().code(), "seq-mismatch");
+        assert_eq!(
+            check(&s, &Seen::default(), &f).unwrap_err().code(),
+            "seq-mismatch"
+        );
     }
 
     #[test]
@@ -355,17 +459,37 @@ mod tests {
         // Beyond tolerance: reported with the amount.
         let bad = good(&s, 5, NOW + 500, 3600);
         let err = check(&s, &Seen::default(), &fetched(&bad, &s.alice)).unwrap_err();
-        assert!(matches!(err, Reject::ClockSkew { ahead: 500, skew: 120, .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Reject::ClockSkew {
+                    ahead: 500,
+                    skew: 120,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(!err.is_soft());
         // A larger configured tolerance accepts it.
-        assert!(verify_item(&s.circle, &Seen::default(), &fetched(&bad, &s.alice), NOW, 600).is_ok());
+        assert!(verify_item(
+            &s.circle,
+            &Seen::default(),
+            &fetched(&bad, &s.alice),
+            NOW,
+            600
+        )
+        .is_ok());
     }
 
     #[test]
     fn replay_rollback_and_seq_reuse() {
         let s = setup();
         let old = good(&s, 5, NOW - 10, 3600);
-        let seen = Seen { highest_seq: 9, payload_sha256: Some("aa".into()) };
+        let seen = Seen {
+            highest_seq: 9,
+            payload_sha256: Some("aa".into()),
+        };
         let err = check(&s, &seen, &fetched(&old, &s.alice)).unwrap_err();
         assert!(matches!(err, Reject::Rollback { seq: 5, highest: 9 }));
         assert_eq!(err.code(), "replay-rollback");
@@ -381,7 +505,10 @@ mod tests {
         let b = good(&s, 4, NOW, 60);
         let mut f = fetched(&b, &s.alice);
         f.salt = Some(b"other".to_vec());
-        assert_eq!(check(&s, &Seen::default(), &f).unwrap_err().code(), "salt-mismatch");
+        assert_eq!(
+            check(&s, &Seen::default(), &f).unwrap_err().code(),
+            "salt-mismatch"
+        );
     }
 
     #[test]
@@ -389,8 +516,15 @@ mod tests {
         let s = setup();
         let b = good(&s, 4, NOW - 7200, 3600);
         let f = fetched(&b, &s.alice);
-        let sha = hex::encode(Payload::decode(item::decode_value(&f.value).unwrap().0).unwrap().hash());
-        let seen = Seen { highest_seq: 4, payload_sha256: Some(sha) };
+        let sha = hex::encode(
+            Payload::decode(item::decode_value(&f.value).unwrap().0)
+                .unwrap()
+                .hash(),
+        );
+        let seen = Seen {
+            highest_seq: 4,
+            payload_sha256: Some(sha),
+        };
         assert_eq!(check(&s, &seen, &f).unwrap_err().code(), "expired");
     }
 }

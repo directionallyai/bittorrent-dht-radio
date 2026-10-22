@@ -68,7 +68,10 @@ impl Jitter {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         if let Some(p) = s.strip_suffix('%') {
-            let pct: f64 = p.trim().parse().with_context(|| format!("invalid jitter {s:?}"))?;
+            let pct: f64 = p
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid jitter {s:?}"))?;
             if !(0.0..=100.0).contains(&pct) {
                 return Err(anyhow!("jitter percentage must be between 0 and 100"));
             }
@@ -100,7 +103,9 @@ pub fn random_unit() -> f64 {
 
 /// Write a file atomically (temp file in the same directory + rename).
 pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let tmp = dir.join(format!(
         ".{}.tmp{}",
@@ -115,7 +120,9 @@ pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
         f.write_all(data)?;
         f.sync_all().ok();
     }
@@ -156,7 +163,10 @@ mod tests {
     #[test]
     fn jitter_parse_and_bounds() {
         assert_eq!(Jitter::parse("10%").unwrap(), Jitter::Percent(10.0));
-        assert_eq!(Jitter::parse("5s").unwrap(), Jitter::Fixed(Duration::from_secs(5)));
+        assert_eq!(
+            Jitter::parse("5s").unwrap(),
+            Jitter::Fixed(Duration::from_secs(5))
+        );
         assert!(Jitter::parse("150%").is_err());
         for _ in 0..100 {
             let d = Jitter::Percent(10.0).sample(Duration::from_secs(100));

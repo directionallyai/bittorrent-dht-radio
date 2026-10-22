@@ -64,8 +64,13 @@ pub enum PayloadError {
 pub fn validate_name(name: &str) -> Result<(), PayloadError> {
     let ok = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if ok {
         Ok(())
     } else {
@@ -77,7 +82,10 @@ pub fn validate_message(message: &str) -> Result<(), PayloadError> {
     if message.is_empty() {
         return Err(PayloadError::EmptyMessage);
     }
-    if let Some(c) = message.chars().find(|c| c.is_control() && *c != '\n' && *c != '\t') {
+    if let Some(c) = message
+        .chars()
+        .find(|c| c.is_control() && *c != '\n' && *c != '\t')
+    {
         return Err(PayloadError::ControlChar(c as u32));
     }
     Ok(())
@@ -94,7 +102,8 @@ impl Payload {
             return Err(PayloadError::ExpiryBeforeIssue);
         }
         if let Some(p) = &self.prev {
-            if p.len() != PREV_HEX_LEN || !p.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            if p.len() != PREV_HEX_LEN || !p.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
                 return Err(PayloadError::BadPrev);
             }
         }
@@ -125,7 +134,9 @@ impl Payload {
         let mut lines = head.split('\n');
         let version = lines.next().unwrap_or_default();
         if version != PROTOCOL {
-            return Err(PayloadError::UnsupportedVersion(version.chars().take(32).collect()));
+            return Err(PayloadError::UnsupportedVersion(
+                version.chars().take(32).collect(),
+            ));
         }
         let sender = field(lines.next(), "from: ")?.to_string();
         let seq = field(lines.next(), "seq: ")?
@@ -144,7 +155,14 @@ impl Payload {
         if lines.next().is_some() {
             return Err(PayloadError::Malformed("unexpected extra header line"));
         }
-        let payload = Payload { sender, seq, issued_at, expires_at, prev, message: message.to_string() };
+        let payload = Payload {
+            sender,
+            seq,
+            issued_at,
+            expires_at,
+            prev,
+            message: message.to_string(),
+        };
         // Canonical form check (rejects leading zeros, '+', non-canonical spacing, ...).
         if payload.encode()? != bytes {
             return Err(PayloadError::Malformed("not in canonical form"));
@@ -169,7 +187,9 @@ pub fn payload_hash(encoded: &[u8]) -> [u8; 32] {
 
 fn field<'a>(line: Option<&'a str>, prefix: &'static str) -> Result<&'a str, PayloadError> {
     line.and_then(|l| l.strip_prefix(prefix))
-        .ok_or(PayloadError::Malformed("missing or out-of-order header field"))
+        .ok_or(PayloadError::Malformed(
+            "missing or out-of-order header field",
+        ))
 }
 
 #[cfg(test)]
@@ -222,7 +242,10 @@ mod tests {
             ok.replace("\r", "").replace("\n\n", "\r\n\r\n"),
             ok.replace("seq: 7\niat: 1700000000\n", "iat: 1700000000\nseq: 7\n"),
         ] {
-            assert!(Payload::decode(bad.as_bytes()).is_err(), "accepted: {bad:?}");
+            assert!(
+                Payload::decode(bad.as_bytes()).is_err(),
+                "accepted: {bad:?}"
+            );
         }
         assert!(matches!(
             Payload::decode(&[0xff, 0xfe]),

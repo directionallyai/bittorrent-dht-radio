@@ -129,7 +129,9 @@ pub struct Store {
 
 impl Store {
     pub fn new(paths: &Paths) -> Self {
-        Store { paths: paths.clone() }
+        Store {
+            paths: paths.clone(),
+        }
     }
 
     pub fn load(&self) -> Result<State> {
@@ -172,7 +174,9 @@ mod tests {
     #[test]
     fn missing_state_is_default_and_updates_persist() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths { root: dir.path().to_path_buf() };
+        let paths = Paths {
+            root: dir.path().to_path_buf(),
+        };
         let store = Store::new(&paths);
         assert_eq!(store.load().unwrap(), State::default());
         store
@@ -180,13 +184,18 @@ mod tests {
                 s.members.entry("k".into()).or_default().highest_seq = 42;
             })
             .unwrap();
-        assert_eq!(Store::new(&paths).load().unwrap().members["k"].highest_seq, 42);
+        assert_eq!(
+            Store::new(&paths).load().unwrap().members["k"].highest_seq,
+            42
+        );
     }
 
     #[test]
     fn concurrent_updates_do_not_lose_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths { root: dir.path().to_path_buf() };
+        let paths = Paths {
+            root: dir.path().to_path_buf(),
+        };
         let handles: Vec<_> = (0..8)
             .map(|i| {
                 let paths = paths.clone();

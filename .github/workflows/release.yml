@@ -1,0 +1,164 @@
+name: Release
+
+# On a `v*` tag push: build standalone binaries for every platform, smoke-test each on its own
+# OS, and attach them with SHA-256 checksums to a GitHub release.
+# Pull requests that touch this file run the build + smoke-test jobs only (nothing is published).
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-amd64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: radio.exe, archive: zip }
+          - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin, exe: radio, archive: tar.gz }
+          - { name: macos-amd64, os: macos-15-intel, target: x86_64-apple-darwin, exe: radio, archive: tar.gz }
+          - { name: linux-amd64, os: ubuntu-latest, target: x86_64-unknown-linux-musl, exe: radio, archive: tar.gz, musl: true }
+          - { name: linux-arm64, os: ubuntu-latest, target: aarch64-unknown-linux-musl, exe: radio, archive: tar.gz, cross: true }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Check that the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Install musl tools (linux-amd64)
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (linux-arm64)
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          # Windows: link the C runtime statically so the .exe has no VC++ redistributable dependency.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Locate binary
+        shell: bash
+        run: |
+          echo "BIN=target/${{ matrix.target }}/release/${{ matrix.exe }}" >> "$GITHUB_ENV"
+
+      # --- smoke tests: run the built binary itself -------------------------------------------
+      - name: Smoke test (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          "$BIN" --version
+          "$BIN" --help
+          # Two independent clients publish/listen concurrently over a private loopback DHT.
+          "$BIN" selftest
+
+      - name: Smoke test (linux-arm64 under qemu user emulation)
+        if: matrix.cross
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          file "$BIN"
+          qemu-aarch64-static "$BIN" --version
+          qemu-aarch64-static "$BIN" --help
+          qemu-aarch64-static "$BIN" selftest
+
+      - name: Package
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in v*) ;; *) tag="dev" ;; esac
+          name="radio-${tag}-${{ matrix.name }}"
+          mkdir -p "dist/${name}"
+          cp "$BIN" README.md "dist/${name}/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "${name}.zip" "${name}" >/dev/null
+            file="${name}.zip"
+          else
+            tar czf "${name}.tar.gz" "${name}"
+            file="${name}.tar.gz"
+          fi
+          rm -rf "${name}"
+          if command -v sha256sum >/dev/null; then sha256sum "$file" > "${file}.sha256"; else shasum -a 256 "$file" > "${file}.sha256"; fi
+          cat "${file}.sha256"
+
+      - name: Smoke test the packaged archive contents
+        shell: bash
+        run: |
+          cd dist
+          mkdir verify
+          if [ "${{ matrix.archive }}" = "zip" ]; then 7z x -overify radio-*.zip >/dev/null; else tar xzf radio-*.tar.gz -C verify; fi
+          ls -R verify
+          test -f verify/*/README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: radio-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: radio-*
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          cd artifacts
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          rm -- *.sha256
+          cat SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

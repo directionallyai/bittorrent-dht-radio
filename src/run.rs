@@ -82,7 +82,9 @@ impl NetHolder<'_> {
             return Ok(n.clone());
         }
         let net = Arc::new(app::connect(self.cfg, self.paths, |m| {
-            printer.emit(&Event::Note { detail: m.to_string() })
+            printer.emit(&Event::Note {
+                detail: m.to_string(),
+            })
         })?);
         *slot = Some(net.clone());
         Ok(net)
@@ -97,7 +99,12 @@ impl NetHolder<'_> {
     }
 
     fn save_cache(&self) {
-        if let Some(n) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(n) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             n.save_routing_cache();
         }
     }
@@ -110,7 +117,9 @@ fn next_delay(base: Duration, jitter: &Option<Jitter>) -> Duration {
 fn read_message(src: &MessageSource) -> Result<String, String> {
     match src {
         MessageSource::Fixed(m) => Ok(m.clone()),
-        MessageSource::File(p) => crate::cli::read_message_file(p).map_err(|e| format!("{}: {e}", p.display())),
+        MessageSource::File(p) => {
+            crate::cli::read_message_file(p).map_err(|e| format!("{}: {e}", p.display()))
+        }
     }
 }
 
@@ -127,9 +136,18 @@ pub fn run(
 ) -> Result<(), Coded> {
     let store_owned = Store::new(paths);
     let store = &store_owned;
-    let holder_owned = NetHolder { cfg, paths, inner: Mutex::new(None) };
+    let holder_owned = NetHolder {
+        cfg,
+        paths,
+        inner: Mutex::new(None),
+    };
     let holder = &holder_owned;
-    let publisher_owned = Publisher { cfg, ssh, dht_key, store };
+    let publisher_owned = Publisher {
+        cfg,
+        ssh,
+        dht_key,
+        store,
+    };
     let publisher = &publisher_owned;
     let skew = cfg.clock_skew_secs;
 
@@ -142,7 +160,9 @@ pub fn run(
             let result = read_message(&opts.message)
                 .map_err(|e| ("reading message".to_string(), e))
                 .and_then(|msg| {
-                    let net = holder.get(printer).map_err(|e| ("publish".to_string(), e.to_string()))?;
+                    let net = holder
+                        .get(printer)
+                        .map_err(|e| ("publish".to_string(), e.to_string()))?;
                     publisher
                         .publish(&net, &msg, opts.ttl.as_secs(), opts.chain_prev, now_secs())
                         .map_err(|e| {
@@ -186,13 +206,18 @@ pub fn run(
                     for e in &report.events {
                         printer.emit(e);
                     }
-                    if report.summary.members > 0 && report.summary.unreachable == report.summary.members {
+                    if report.summary.members > 0
+                        && report.summary.unreachable == report.summary.members
+                    {
                         holder.invalidate();
                     } else {
                         holder.save_cache();
                     }
                 }
-                Err(e) => printer.emit(&Event::Error { context: "listen".into(), detail: e.to_string() }),
+                Err(e) => printer.emit(&Event::Error {
+                    context: "listen".into(),
+                    detail: e.to_string(),
+                }),
             }
             if shutdown.wait(next_delay(opts.listen_every, &opts.jitter)) {
                 break;
@@ -205,14 +230,19 @@ pub fn run(
                 if shutdown.wait(next_delay(every, &opts.jitter)) {
                     break;
                 }
-                let result = holder.get(printer).and_then(|net| ops::republish(store, dht_key, &net, now_secs()));
+                let result = holder
+                    .get(printer)
+                    .and_then(|net| ops::republish(store, dht_key, &net, now_secs()));
                 match result {
                     Ok(report) => printer.emit(&report.event()),
                     Err(e) => {
                         if e.code == exit::DHT_UNAVAILABLE {
                             holder.invalidate();
                         }
-                        printer.emit(&Event::Error { context: "republish".into(), detail: e.to_string() });
+                        printer.emit(&Event::Error {
+                            context: "republish".into(),
+                            detail: e.to_string(),
+                        });
                     }
                 }
             });

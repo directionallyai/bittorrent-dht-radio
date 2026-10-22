@@ -52,7 +52,11 @@ pub enum Command {
     /// Create the config dir and publisher key, and choose the SSH signing key
     Init(InitArgs),
     /// Print your shareable circle card (name, SSH key, DHT key, salt) with fingerprints
-    Card,
+    Card {
+        /// Write the card to this file (UTF-8) instead of stdout
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
     /// Manage the locally pinned circle of members you listen to
     #[command(subcommand)]
     Circle(CircleCmd),
@@ -94,6 +98,9 @@ pub struct InitArgs {
     /// Bootstrap peer(s) as IP:port (default: public mainline routers)
     #[arg(long, value_name = "IP:PORT")]
     pub bootstrap: Vec<String>,
+    /// Also write your card to this file (UTF-8; handy on Windows PowerShell where `>` writes UTF-16)
+    #[arg(long, value_name = "FILE")]
+    pub card_out: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -105,7 +112,12 @@ pub enum CircleCmd {
     /// Unpin a member (their accepted-seq history is kept)
     Remove { name: String },
     /// Print a pinned member's card (or yours when no name is given)
-    Export { name: Option<String> },
+    Export {
+        name: Option<String>,
+        /// Write the card to this file (UTF-8) instead of stdout
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -207,7 +219,7 @@ pub fn dispatch(cli: Cli) -> Result<i32, Coded> {
     let printer = Printer::new(cli.json);
     match cli.command {
         Command::Init(a) => cmd_init(&paths, a, cli.json),
-        Command::Card => cmd_card(&paths, cli.json),
+        Command::Card { out } => cmd_card(&paths, out.as_deref(), cli.json),
         Command::Circle(c) => cmd_circle(&paths, c, cli.json),
         Command::Publish(a) => cmd_publish(&paths, a, &printer),
         Command::Republish => cmd_republish(&paths, &printer),
@@ -220,10 +232,19 @@ pub fn dispatch(cli: Cli) -> Result<i32, Coded> {
 }
 
 fn note(printer: &Printer) -> impl FnMut(&str) + '_ {
-    move |m| printer.emit(&Event::Note { detail: m.to_string() })
+    move |m| {
+        printer.emit(&Event::Note {
+            detail: m.to_string(),
+        })
+    }
 }
 
-fn print_card_block(m: &Member, json: bool) {
+fn print_card_to(m: &Member, json: bool, out: Option<&Path>) -> Result<(), Coded> {
+    if let Some(path) = out {
+        util::write_atomic(path, m.to_card().as_bytes(), false).code(exit::ERROR)?;
+        eprintln!("card written to {}", path.display());
+        return Ok(());
+    }
     if json {
         println!(
             "{}",
@@ -237,30 +258,40 @@ fn print_card_block(m: &Member, json: bool) {
     } else {
         print!("{}", m.to_card());
     }
+    Ok(())
 }
 
 fn cmd_init(paths: &Paths, a: InitArgs, json: bool) -> Result<i32, Coded> {
     let ssh = match (a.ssh_key, a.ssh_agent) {
         (Some(p), None) => SshChoice::KeyFile(p),
-        (None, Some(id)) => SshChoice::Agent { identity: id, socket: a.agent_socket },
+        (None, Some(id)) => SshChoice::Agent {
+            identity: id,
+            socket: a.agent_socket,
+        },
         _ => unreachable!("clap enforces exactly one signer"),
     };
     let card = app::init(
         paths,
-        &InitOptions { name: a.name, ssh, salt: a.salt, bootstrap: a.bootstrap, dht: None },
+        &InitOptions {
+            name: a.name,
+            ssh,
+            salt: a.salt,
+            bootstrap: a.bootstrap,
+            dht: None,
+        },
     )?;
     if !json {
         eprintln!("Initialised {}", paths.root.display());
         eprintln!("Share this card with the people who should listen to you; they must verify the");
         eprintln!("fingerprints with you out of band (voice call, in person) before pinning it.\n");
     }
-    print_card_block(&card, json);
+    print_card_to(&card, json, a.card_out.as_deref())?;
     Ok(exit::OK)
 }
 
-fn cmd_card(paths: &Paths, json: bool) -> Result<i32, Coded> {
+fn cmd_card(paths: &Paths, out: Option<&Path>, json: bool) -> Result<i32, Coded> {
     let cfg = app::load_config(paths)?;
-    print_card_block(&app::own_card(paths, &cfg)?, json);
+    print_card_to(&app::own_card(paths, &cfg)?, json, out)?;
     Ok(exit::OK)
 }
 
@@ -290,16 +321,23 @@ fn cmd_circle(paths: &Paths, cmd: CircleCmd, json: bool) -> Result<i32, Coded> {
     match cmd {
         CircleCmd::Add(a) => {
             let member = if let Some(card) = a.card {
-                let text = if card == "-" {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s).code(exit::CONFIG)?;
-                    s
+                let bytes = if card == "-" {
+                    let mut b = Vec::new();
+                    std::io::stdin().read_to_end(&mut b).code(exit::CONFIG)?;
+                    b
                 } else {
-                    std::fs::read_to_string(&card).with_context(|| format!("reading card {card}")).code(exit::CONFIG)?
+                    std::fs::read(&card)
+                        .with_context(|| format!("reading card {card}"))
+                        .code(exit::CONFIG)?
                 };
-                Member::from_card(&text).code(exit::CONFIG)?
+                Member::from_card_bytes(&bytes).code(exit::CONFIG)?
             } else {
-                let name = a.name.ok_or_else(|| coded(exit::CONFIG, "give --card FILE, or --name with --ssh-key/--ssh-key-file and --dht-key"))?;
+                let name = a.name.ok_or_else(|| {
+                    coded(
+                        exit::CONFIG,
+                        "give --card FILE, or --name with --ssh-key/--ssh-key-file and --dht-key",
+                    )
+                })?;
                 let ssh = match (a.ssh_key, a.ssh_key_file) {
                     (Some(k), _) => k,
                     (None, Some(f)) => std::fs::read_to_string(&f)
@@ -311,12 +349,16 @@ fn cmd_circle(paths: &Paths, cmd: CircleCmd, json: bool) -> Result<i32, Coded> {
                         .to_string(),
                     _ => return Err(coded(exit::CONFIG, "missing --ssh-key or --ssh-key-file")),
                 };
-                let dht = a.dht_key.ok_or_else(|| coded(exit::CONFIG, "missing --dht-key"))?;
+                let dht = a
+                    .dht_key
+                    .ok_or_else(|| coded(exit::CONFIG, "missing --dht-key"))?;
                 Member::new(&name, &ssh, &dht, a.salt.as_deref()).code(exit::CONFIG)?
             };
             let mut circle = app::load_circle(paths)?;
             // Fail on conflicts before asking the user anything.
-            let mut probe = Circle { members: circle.members.clone() };
+            let mut probe = Circle {
+                members: circle.members.clone(),
+            };
             probe.add(member.clone()).code(exit::CONFIG)?;
 
             eprintln!("Member to pin:\n{}\n", describe_member(&member));
@@ -326,7 +368,10 @@ fn cmd_circle(paths: &Paths, cmd: CircleCmd, json: bool) -> Result<i32, Coded> {
             circle.add(member.clone()).code(exit::CONFIG)?;
             circle.save(&paths.circle_file()).code(exit::ERROR)?;
             if json {
-                println!("{}", serde_json::json!({"type": "pinned", "name": member.name}));
+                println!(
+                    "{}",
+                    serde_json::json!({"type": "pinned", "name": member.name})
+                );
             } else {
                 println!("pinned {}", member.name);
             }
@@ -359,17 +404,22 @@ fn cmd_circle(paths: &Paths, cmd: CircleCmd, json: bool) -> Result<i32, Coded> {
             let mut circle = app::load_circle(paths)?;
             let m = circle.remove(&name).code(exit::CONFIG)?;
             circle.save(&paths.circle_file()).code(exit::ERROR)?;
-            println!("removed {} (their accepted-seq history is kept in state.json)", m.name);
+            println!(
+                "removed {} (their accepted-seq history is kept in state.json)",
+                m.name
+            );
             Ok(exit::OK)
         }
-        CircleCmd::Export { name } => {
+        CircleCmd::Export { name, out } => {
             match name {
                 Some(n) => {
                     let circle = app::load_circle(paths)?;
-                    let m = circle.find(&n).ok_or_else(|| coded(exit::CONFIG, format!("no member named {n:?}")))?;
-                    print_card_block(m, json);
+                    let m = circle
+                        .find(&n)
+                        .ok_or_else(|| coded(exit::CONFIG, format!("no member named {n:?}")))?;
+                    print_card_to(m, json, out.as_deref())?;
                 }
-                None => return cmd_card(paths, json),
+                None => return cmd_card(paths, out.as_deref(), json),
             }
             Ok(exit::OK)
         }
@@ -379,7 +429,8 @@ fn cmd_circle(paths: &Paths, cmd: CircleCmd, json: bool) -> Result<i32, Coded> {
 fn read_publish_message(a: &PublishArgs) -> Result<String, Coded> {
     match (&a.message, &a.file) {
         (Some(m), _) => Ok(m.clone()),
-        (None, Some(f)) => read_message_file(f).map_err(|e| coded(exit::BAD_MESSAGE, format!("{}: {e}", f.display()))),
+        (None, Some(f)) => read_message_file(f)
+            .map_err(|e| coded(exit::BAD_MESSAGE, format!("{}: {e}", f.display()))),
         _ => unreachable!("clap enforces one source"),
     }
 }
@@ -393,13 +444,25 @@ fn cmd_publish(paths: &Paths, a: PublishArgs, printer: &Printer) -> Result<i32, 
     };
     // Cheap local checks first: no signer prompt or network for an oversized message.
     let store = Store::new(paths);
-    ops::preflight_for(&store, &cfg, &message, ttl.as_secs(), !a.no_prev, now_secs())?;
+    ops::preflight_for(
+        &store,
+        &cfg,
+        &message,
+        ttl.as_secs(),
+        !a.no_prev,
+        now_secs(),
+    )?;
 
     let ssh = app::load_signer(&cfg)?;
     let dht_key = config::load_publisher_key(paths).code(exit::CONFIG)?;
     let net = app::connect(&cfg, paths, note(printer))?;
-    let report = Publisher { cfg: &cfg, ssh: &ssh, dht_key: &dht_key, store: &store }
-        .publish(&net, &message, ttl.as_secs(), !a.no_prev, now_secs())?;
+    let report = Publisher {
+        cfg: &cfg,
+        ssh: &ssh,
+        dht_key: &dht_key,
+        store: &store,
+    }
+    .publish(&net, &message, ttl.as_secs(), !a.no_prev, now_secs())?;
     net.save_routing_cache();
     printer.emit(&report.event());
     Ok(exit::OK)
@@ -431,7 +494,12 @@ fn cmd_listen(paths: &Paths, a: ListenArgs, printer: &Printer) -> Result<i32, Co
     let store = Store::new(paths);
     let skew = cfg.clock_skew_secs;
     let interval = util::parse_duration(&a.interval).code(exit::CONFIG)?;
-    let jitter = a.jitter.as_deref().map(Jitter::parse).transpose().code(exit::CONFIG)?;
+    let jitter = a
+        .jitter
+        .as_deref()
+        .map(Jitter::parse)
+        .transpose()
+        .code(exit::CONFIG)?;
 
     let net = match app::connect(&cfg, paths, note(printer)) {
         Ok(n) => Ok(n),
@@ -508,11 +576,26 @@ fn cmd_run(paths: &Paths, a: RunArgs, printer: &Printer) -> Result<i32, Coded> {
         },
         publish_every,
         listen_every,
-        jitter: a.jitter.as_deref().map(Jitter::parse).transpose().code(exit::CONFIG)?,
-        republish_every: a.republish_every.as_deref().map(util::parse_duration).transpose().code(exit::CONFIG)?,
+        jitter: a
+            .jitter
+            .as_deref()
+            .map(Jitter::parse)
+            .transpose()
+            .code(exit::CONFIG)?,
+        republish_every: a
+            .republish_every
+            .as_deref()
+            .map(util::parse_duration)
+            .transpose()
+            .code(exit::CONFIG)?,
         ttl,
         chain_prev: !a.no_prev,
-        exit_after: a.exit_after.as_deref().map(util::parse_duration).transpose().code(exit::CONFIG)?,
+        exit_after: a
+            .exit_after
+            .as_deref()
+            .map(util::parse_duration)
+            .transpose()
+            .code(exit::CONFIG)?,
     };
     let ssh = app::load_signer(&cfg)?;
     let dht_key = config::load_publisher_key(paths).code(exit::CONFIG)?;
@@ -530,6 +613,8 @@ fn cmd_run(paths: &Paths, a: RunArgs, printer: &Printer) -> Result<i32, Coded> {
             opts.republish_every.map(|r| format!(", republish every {r:?} (unchanged item; not a liveness signal)")).unwrap_or_default()
         ),
     });
-    run::run(paths, &cfg, &circle, &ssh, &dht_key, &opts, printer, &shutdown)?;
+    run::run(
+        paths, &cfg, &circle, &ssh, &dht_key, &opts, printer, &shutdown,
+    )?;
     Ok(exit::OK)
 }

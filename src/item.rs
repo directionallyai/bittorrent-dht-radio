@@ -27,7 +27,12 @@ pub enum ItemError {
         "value is {bencoded} bytes bencoded, over the BEP 44 limit of {MAX_V_BENCODED} by {over} bytes; \
          shorten the message (the payload header and SSH signature use {overhead} bytes, leaving {room} bytes for the message with this name/seq)"
     )]
-    TooLarge { bencoded: usize, over: usize, overhead: usize, room: usize },
+    TooLarge {
+        bencoded: usize,
+        over: usize,
+        overhead: usize,
+        room: usize,
+    },
     #[error("malformed value: {0}")]
     Malformed(&'static str),
 }
@@ -90,7 +95,9 @@ pub fn decode_value(v: &[u8]) -> Result<(&[u8], &[u8]), ItemError> {
     let plen = u16::from_be_bytes([v[0], v[1]]) as usize;
     let rest = &v[2..];
     if plen == 0 || plen >= rest.len() {
-        return Err(ItemError::Malformed("payload length prefix does not fit the value"));
+        return Err(ItemError::Malformed(
+            "payload length prefix does not fit the value",
+        ));
     }
     Ok((&rest[..plen], &rest[plen..]))
 }
@@ -120,17 +127,34 @@ mod tests {
 
         let payload_big = vec![b'x'; MAX_RAW_V - 2 - sig.len() + 1];
         let err = encode_value(&payload_big, &sig).unwrap_err();
-        assert!(matches!(err, ItemError::TooLarge { bencoded: 1001, over: 1, .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                ItemError::TooLarge {
+                    bencoded: 1001,
+                    over: 1,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(matches!(
             check_payload_fits(payload_big.len()),
-            Err(ItemError::TooLarge { bencoded: 1001, over: 1, .. })
+            Err(ItemError::TooLarge {
+                bencoded: 1001,
+                over: 1,
+                ..
+            })
         ));
     }
 
     #[test]
     fn decode_roundtrip_and_malformed() {
         let v = encode_value(b"payload", b"signature").unwrap();
-        assert_eq!(decode_value(&v).unwrap(), (&b"payload"[..], &b"signature"[..]));
+        assert_eq!(
+            decode_value(&v).unwrap(),
+            (&b"payload"[..], &b"signature"[..])
+        );
         assert!(decode_value(&[]).is_err());
         assert!(decode_value(&[0, 0, 1]).is_err());
         assert!(decode_value(&[0, 9, 1, 2]).is_err());

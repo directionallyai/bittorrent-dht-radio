@@ -19,7 +19,10 @@ pub enum SshChoice {
     /// A private key file.
     KeyFile(PathBuf),
     /// An ssh-agent identity: a `.pub` file path, an `SHA256:` fingerprint or an OpenSSH public key line.
-    Agent { identity: String, socket: Option<PathBuf> },
+    Agent {
+        identity: String,
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +51,10 @@ pub fn init(paths: &Paths, opts: &InitOptions) -> Result<Member, Coded> {
     if paths.publisher_key().exists() {
         return Err(coded(
             exit::CONFIG,
-            format!("{} exists without a config.toml; refusing to touch it", paths.publisher_key().display()),
+            format!(
+                "{} exists without a config.toml; refusing to touch it",
+                paths.publisher_key().display()
+            ),
         ));
     }
 
@@ -64,11 +70,19 @@ pub fn init(paths: &Paths, opts: &InitOptions) -> Result<Member, Coded> {
             let sock = socket
                 .clone()
                 .or_else(sshsig::default_agent_socket)
-                .ok_or_else(|| coded(exit::SIGNING, "no ssh-agent socket: SSH_AUTH_SOCK is not set; pass --agent-socket"))?;
+                .ok_or_else(|| {
+                    coded(
+                        exit::SIGNING,
+                        "no ssh-agent socket: SSH_AUTH_SOCK is not set; pass --agent-socket",
+                    )
+                })?;
             let public = resolve_agent_identity(&sock, identity)?;
             let signer = Signer::agent(sock, public.clone()).code(exit::SIGNING)?;
             (
-                SshConfig::Agent { public_key: sshsig::public_key_text(&public), socket: socket.clone() },
+                SshConfig::Agent {
+                    public_key: sshsig::public_key_text(&public),
+                    socket: socket.clone(),
+                },
                 signer,
             )
         }
@@ -77,7 +91,12 @@ pub fn init(paths: &Paths, opts: &InitOptions) -> Result<Member, Coded> {
     // Prove now that unattended signing works with this choice (prompts/touch would show up here).
     signer.sign(b"radio init self-test").code(exit::SIGNING)?;
 
-    let mut cfg = Config { name: opts.name.clone(), salt: opts.salt.clone(), ssh: ssh_cfg, ..Default::default() };
+    let mut cfg = Config {
+        name: opts.name.clone(),
+        salt: opts.salt.clone(),
+        ssh: ssh_cfg,
+        ..Default::default()
+    };
     if let Some(d) = &opts.dht {
         cfg.dht = d.clone();
     }
@@ -86,10 +105,14 @@ pub fn init(paths: &Paths, opts: &InitOptions) -> Result<Member, Coded> {
     }
     cfg.validate().code(exit::CONFIG)?;
 
-    std::fs::create_dir_all(&paths.root).with_context(|| format!("creating {}", paths.root.display())).code(exit::ERROR)?;
+    std::fs::create_dir_all(&paths.root)
+        .with_context(|| format!("creating {}", paths.root.display()))
+        .code(exit::ERROR)?;
     let dht = config::create_publisher_key(paths).code(exit::ERROR)?;
     cfg.save(paths).code(exit::ERROR)?;
-    Circle::default().save(&paths.circle_file()).code(exit::ERROR)?;
+    Circle::default()
+        .save(&paths.circle_file())
+        .code(exit::ERROR)?;
 
     Member::new(
         &cfg.name,
@@ -105,7 +128,10 @@ fn resolve_agent_identity(socket: &Path, spec: &str) -> Result<PublicKey, Coded>
     let wanted: Option<PublicKey> = if spec.starts_with("SHA256:") {
         None
     } else if let Ok(text) = std::fs::read_to_string(spec) {
-        Some(sshsig::parse_public_key(text.lines().next().unwrap_or("")).map_err(|e| coded(exit::SIGNING, format!("{spec}: {e}")))?)
+        Some(
+            sshsig::parse_public_key(text.lines().next().unwrap_or(""))
+                .map_err(|e| coded(exit::SIGNING, format!("{spec}: {e}")))?,
+        )
     } else {
         Some(sshsig::parse_public_key(spec).map_err(|e| {
             coded(exit::SIGNING, format!("--ssh-agent expects a .pub file, an SHA256: fingerprint or a public key line: {e}"))
@@ -116,7 +142,12 @@ fn resolve_agent_identity(socket: &Path, spec: &str) -> Result<PublicKey, Coded>
         None => sshsig::fingerprint(k) == spec,
     });
     let key = found.ok_or_else(|| {
-        coded(exit::SIGNING, format!("the ssh-agent does not hold the requested identity {spec:?} (see `ssh-add -L`)"))
+        coded(
+            exit::SIGNING,
+            format!(
+                "the ssh-agent does not hold the requested identity {spec:?} (see `ssh-add -L`)"
+            ),
+        )
     })?;
     if sshsig::is_fido_key(&key) {
         return Err(coded(exit::SIGNING, "FIDO2 security keys need a touch per signature and cannot sign unattended; use an Ed25519 key"));
@@ -130,7 +161,9 @@ pub fn passphrase(allow_prompt: bool) -> Option<String> {
         return Some(p);
     }
     if allow_prompt && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        return rpassword::prompt_password("SSH key passphrase (leave empty if none): ").ok().filter(|p| !p.is_empty());
+        return rpassword::prompt_password("SSH key passphrase (leave empty if none): ")
+            .ok()
+            .filter(|p| !p.is_empty());
     }
     None
 }
@@ -149,11 +182,17 @@ pub fn load_signer(cfg: &Config) -> Result<Signer, Coded> {
     match &cfg.ssh {
         SshConfig::File { key_path } => signer_from_file(key_path),
         SshConfig::Agent { public_key, socket } => {
-            let public = sshsig::parse_public_key(public_key).map_err(|e| coded(exit::CONFIG, e))?;
+            let public =
+                sshsig::parse_public_key(public_key).map_err(|e| coded(exit::CONFIG, e))?;
             let sock = socket
                 .clone()
                 .or_else(sshsig::default_agent_socket)
-                .ok_or_else(|| coded(exit::SIGNING, "no ssh-agent socket: SSH_AUTH_SOCK is not set"))?;
+                .ok_or_else(|| {
+                    coded(
+                        exit::SIGNING,
+                        "no ssh-agent socket: SSH_AUTH_SOCK is not set",
+                    )
+                })?;
             Signer::agent(sock, public).code(exit::SIGNING)
         }
     }
@@ -171,15 +210,22 @@ pub fn ssh_public(cfg: &Config) -> Result<PublicKey, Coded> {
                 .code(exit::SIGNING)?;
             Ok(key.public_key().clone())
         }
-        SshConfig::Agent { public_key, .. } => sshsig::parse_public_key(public_key).map_err(|e| coded(exit::CONFIG, e)),
+        SshConfig::Agent { public_key, .. } => {
+            sshsig::parse_public_key(public_key).map_err(|e| coded(exit::CONFIG, e))
+        }
     }
 }
 
 pub fn own_card(paths: &Paths, cfg: &Config) -> Result<Member, Coded> {
     let dht = config::load_publisher_key(paths).code(exit::CONFIG)?;
     let ssh = ssh_public(cfg)?;
-    Member::new(&cfg.name, &sshsig::public_key_text(&ssh), &hex::encode(dht.verifying_key().to_bytes()), cfg.salt.as_deref())
-        .code(exit::ERROR)
+    Member::new(
+        &cfg.name,
+        &sshsig::public_key_text(&ssh),
+        &hex::encode(dht.verifying_key().to_bytes()),
+        cfg.salt.as_deref(),
+    )
+    .code(exit::ERROR)
 }
 
 pub fn load_circle(paths: &Paths) -> Result<Circle, Coded> {

@@ -39,7 +39,9 @@ impl Paths {
             PathBuf::from(p)
         } else {
             directories::ProjectDirs::from("com", "directionally", "radio")
-                .ok_or_else(|| anyhow!("cannot determine a per-user config directory; pass --config-dir"))?
+                .ok_or_else(|| {
+                    anyhow!("cannot determine a per-user config directory; pass --config-dir")
+                })?
                 .config_dir()
                 .to_path_buf()
         };
@@ -132,7 +134,9 @@ impl Default for Config {
         Config {
             name: String::new(),
             salt: None,
-            ssh: SshConfig::File { key_path: PathBuf::new() },
+            ssh: SshConfig::File {
+                key_path: PathBuf::new(),
+            },
             message_ttl: "24h".into(),
             clock_skew_secs: 120,
             dht: DhtConfig::default(),
@@ -145,13 +149,18 @@ impl Config {
         let path = paths.config_file();
         let text = std::fs::read_to_string(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow!("not initialised: {} not found (run `radio init` first)", path.display())
+                anyhow!(
+                    "not initialised: {} not found (run `radio init` first)",
+                    path.display()
+                )
             } else {
                 anyhow!("reading {}: {e}", path.display())
             }
         })?;
-        let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        cfg.validate().with_context(|| format!("invalid {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate()
+            .with_context(|| format!("invalid {}", path.display()))?;
         Ok(cfg)
     }
 
@@ -184,9 +193,14 @@ impl Config {
 /// Load the BEP 44 publisher key (a 32-byte Ed25519 seed stored as hex).
 pub fn load_publisher_key(paths: &Paths) -> Result<mainline::SigningKey> {
     let path = paths.publisher_key();
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading publisher key {} (run `radio init`)", path.display()))?;
-    let bytes = hex::decode(text.trim()).with_context(|| format!("{} is not hex", path.display()))?;
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading publisher key {} (run `radio init`)",
+            path.display()
+        )
+    })?;
+    let bytes =
+        hex::decode(text.trim()).with_context(|| format!("{} is not hex", path.display()))?;
     let seed: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow!("{} must contain a 32-byte seed", path.display()))?;
@@ -198,7 +212,10 @@ pub fn create_publisher_key(paths: &Paths) -> Result<mainline::SigningKey> {
     use rand_core::RngCore;
     let path = paths.publisher_key();
     if path.exists() {
-        bail!("{} already exists; refusing to overwrite the publisher key", path.display());
+        bail!(
+            "{} already exists; refusing to overwrite the publisher key",
+            path.display()
+        );
     }
     let mut seed = [0u8; 32];
     rand_core::OsRng.fill_bytes(&mut seed);
@@ -214,12 +231,20 @@ mod tests {
     fn config_roundtrip_both_signer_kinds() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::resolve(Some(dir.path())).unwrap();
-        let mut cfg = Config { name: "alice".into(), ..Default::default() };
-        cfg.ssh = SshConfig::File { key_path: "/home/a/.ssh/id_ed25519".into() };
+        let mut cfg = Config {
+            name: "alice".into(),
+            ..Default::default()
+        };
+        cfg.ssh = SshConfig::File {
+            key_path: "/home/a/.ssh/id_ed25519".into(),
+        };
         cfg.dht.bootstrap = vec!["127.0.0.1:6881".into()];
         cfg.save(&paths).unwrap();
         assert_eq!(Config::load(&paths).unwrap(), cfg);
-        cfg.ssh = SshConfig::Agent { public_key: "ssh-ed25519 AAAA".into(), socket: None };
+        cfg.ssh = SshConfig::Agent {
+            public_key: "ssh-ed25519 AAAA".into(),
+            socket: None,
+        };
         cfg.save(&paths).unwrap();
         assert_eq!(Config::load(&paths).unwrap(), cfg);
     }
@@ -237,12 +262,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::resolve(Some(dir.path())).unwrap();
         let k = create_publisher_key(&paths).unwrap();
-        assert_eq!(load_publisher_key(&paths).unwrap().verifying_key(), k.verifying_key());
+        assert_eq!(
+            load_publisher_key(&paths).unwrap().verifying_key(),
+            k.verifying_key()
+        );
         assert!(create_publisher_key(&paths).is_err());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(paths.publisher_key()).unwrap().permissions().mode();
+            let mode = std::fs::metadata(paths.publisher_key())
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o077, 0);
         }
     }

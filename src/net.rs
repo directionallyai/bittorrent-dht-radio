@@ -88,10 +88,17 @@ pub enum NetError {
 /// resolver on a helper thread so a dead resolver cannot hang the process.
 pub fn resolve_entries(cfg: &NetConfig) -> Vec<BootstrapEntry> {
     let mut out = Vec::new();
-    let mut listed: Vec<(String, EntryKind)> =
-        cfg.bootstrap.iter().map(|s| (s.clone(), EntryKind::Literal)).collect();
+    let mut listed: Vec<(String, EntryKind)> = cfg
+        .bootstrap
+        .iter()
+        .map(|s| (s.clone(), EntryKind::Literal))
+        .collect();
     if cfg.bootstrap.is_empty() || cfg.include_default_bootstrap {
-        listed.extend(DEFAULT_BOOTSTRAP_NODES.iter().map(|s| (s.to_string(), EntryKind::Default)));
+        listed.extend(
+            DEFAULT_BOOTSTRAP_NODES
+                .iter()
+                .map(|s| (s.to_string(), EntryKind::Default)),
+        );
     }
     if let Some(path) = &cfg.cache_path {
         listed.extend(read_cache(path).into_iter().map(|s| (s, EntryKind::Cached)));
@@ -112,11 +119,19 @@ fn resolve_one(entry: &str, kind: EntryKind, timeout: Duration) -> BootstrapEntr
     match entry.parse::<SocketAddr>() {
         Ok(SocketAddr::V4(a)) => return mk(kind, vec![a], None),
         Ok(SocketAddr::V6(_)) => {
-            return mk(kind, vec![], Some("IPv6 bootstrap peers are not supported by the DHT client".into()))
+            return mk(
+                kind,
+                vec![],
+                Some("IPv6 bootstrap peers are not supported by the DHT client".into()),
+            )
         }
         Err(_) => {}
     }
-    let kind = if kind == EntryKind::Literal { EntryKind::Dns } else { kind };
+    let kind = if kind == EntryKind::Literal {
+        EntryKind::Dns
+    } else {
+        kind
+    };
     let (tx, rx) = mpsc::channel();
     let host = entry.to_string();
     std::thread::spawn(move || {
@@ -136,7 +151,11 @@ fn resolve_one(entry: &str, kind: EntryKind, timeout: Duration) -> BootstrapEntr
         Ok(Ok(addrs)) if !addrs.is_empty() => mk(kind, addrs, None),
         Ok(Ok(_)) => mk(kind, vec![], Some("resolved to no IPv4 address".into())),
         Ok(Err(e)) => mk(kind, vec![], Some(format!("cannot resolve: {e}"))),
-        Err(_) => mk(kind, vec![], Some(format!("DNS lookup timed out after {timeout:?}"))),
+        Err(_) => mk(
+            kind,
+            vec![],
+            Some(format!("DNS lookup timed out after {timeout:?}")),
+        ),
     }
 }
 
@@ -202,23 +221,42 @@ impl Net {
         let entries = resolve_entries(cfg);
         for e in &entries {
             if let Some(err) = &e.error {
-                progress(&format!("bootstrap {} ({}): {err}", e.entry, e.kind.as_str()));
+                progress(&format!(
+                    "bootstrap {} ({}): {err}",
+                    e.entry,
+                    e.kind.as_str()
+                ));
             }
         }
-        let mut addrs: Vec<SocketAddrV4> = entries.iter().flat_map(|e| e.resolved.iter().copied()).collect();
+        let mut addrs: Vec<SocketAddrV4> = entries
+            .iter()
+            .flat_map(|e| e.resolved.iter().copied())
+            .collect();
         addrs.sort();
         addrs.dedup();
         if addrs.is_empty() {
             let detail = entries
                 .iter()
-                .map(|e| format!("{}: {}", e.entry, e.error.as_deref().unwrap_or("no addresses")))
+                .map(|e| {
+                    format!(
+                        "{}: {}",
+                        e.entry,
+                        e.error.as_deref().unwrap_or("no addresses")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(NetError::NoBootstrap(if detail.is_empty() { "none configured".into() } else { detail }));
+            return Err(NetError::NoBootstrap(if detail.is_empty() {
+                "none configured".into()
+            } else {
+                detail
+            }));
         }
 
         let mut builder = Dht::builder();
-        builder.bootstrap(&addrs).request_timeout(cfg.request_timeout);
+        builder
+            .bootstrap(&addrs)
+            .request_timeout(cfg.request_timeout);
         if let Some(a) = cfg.bind_address {
             builder.bind_address(a);
         }
@@ -230,15 +268,25 @@ impl Net {
         let mut delay = cfg.backoff;
         for attempt in 1..=cfg.attempts {
             if block_on(dht.bootstrapped()) {
-                return Ok(Net { dht, entries, attempts_used: attempt, cache_path: cfg.cache_path.clone() });
+                return Ok(Net {
+                    dht,
+                    entries,
+                    attempts_used: attempt,
+                    cache_path: cfg.cache_path.clone(),
+                });
             }
             if attempt < cfg.attempts {
-                progress(&format!("bootstrap attempt {attempt}/{} failed; retrying in {delay:?}", cfg.attempts));
+                progress(&format!(
+                    "bootstrap attempt {attempt}/{} failed; retrying in {delay:?}",
+                    cfg.attempts
+                ));
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(Duration::from_secs(30));
             }
         }
-        Err(NetError::BootstrapFailed { attempts: cfg.attempts })
+        Err(NetError::BootstrapFailed {
+            attempts: cfg.attempts,
+        })
     }
 
     /// Fetch the most recent item for `(key, salt)`.
@@ -249,14 +297,19 @@ impl Net {
             while let Some(item) = detailed.items.next().await {
                 let better = match &best {
                     None => true,
-                    Some(b) => item.seq() > b.seq() || (item.seq() == b.seq() && item.value() > b.value()),
+                    Some(b) => {
+                        item.seq() > b.seq() || (item.seq() == b.seq() && item.value() > b.value())
+                    }
                 };
                 if better {
                     best = Some(item);
                 }
             }
             let outcome = detailed.outcome.recv().await;
-            GetResult { item: best, outcome }
+            GetResult {
+                item: best,
+                outcome,
+            }
         })
     }
 
@@ -264,12 +317,12 @@ impl Net {
     pub fn put(&self, item: MutableItem, cas: Option<i64>) -> Result<u32, PutFailure> {
         match block_on(self.dht.put_mutable(item, cas)) {
             Ok(outcome) => Ok(outcome.stored_at),
-            Err(PutMutableError::Query(PutQueryError::NoClosestNodes)) => {
-                Err(PutFailure::Unavailable("no DHT nodes to store at (routing table empty)".into()))
-            }
-            Err(PutMutableError::Query(PutQueryError::Timeout)) => {
-                Err(PutFailure::Unavailable("UDP timeout: no storage node answered".into()))
-            }
+            Err(PutMutableError::Query(PutQueryError::NoClosestNodes)) => Err(
+                PutFailure::Unavailable("no DHT nodes to store at (routing table empty)".into()),
+            ),
+            Err(PutMutableError::Query(PutQueryError::Timeout)) => Err(PutFailure::Unavailable(
+                "UDP timeout: no storage node answered".into(),
+            )),
             Err(PutMutableError::Query(PutQueryError::ErrorResponse(e))) => {
                 Err(PutFailure::Rejected(format!("{e:?}")))
             }
@@ -334,7 +387,11 @@ mod tests {
     fn unresolvable_host_is_reported_but_literal_still_works() {
         let e = resolve_entries(&cfg(&["does-not-exist.invalid:6881", "127.0.0.1:6881"]));
         assert_eq!(e[0].kind, EntryKind::Dns);
-        assert!(e[0].resolved.is_empty() && e[0].error.is_some(), "{:?}", e[0]);
+        assert!(
+            e[0].resolved.is_empty() && e[0].error.is_some(),
+            "{:?}",
+            e[0]
+        );
         assert_eq!(e[1].resolved.len(), 1);
     }
 
@@ -346,7 +403,9 @@ mod tests {
 
     #[test]
     fn nothing_resolvable_is_a_distinct_error() {
-        let err = Net::connect(&cfg(&["does-not-exist.invalid:6881"]), |_| {}).err().unwrap();
+        let err = Net::connect(&cfg(&["does-not-exist.invalid:6881"]), |_| {})
+            .err()
+            .unwrap();
         assert!(matches!(err, NetError::NoBootstrap(_)), "{err}");
     }
 

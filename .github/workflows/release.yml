@@ -120,11 +120,12 @@ jobs:
       - name: Smoke test the packaged archive contents
         shell: bash
         run: |
+          verify="${RUNNER_TEMP}/verify"
+          mkdir -p "$verify"
           cd dist
-          mkdir verify
-          if [ "${{ matrix.archive }}" = "zip" ]; then 7z x -overify radio-*.zip >/dev/null; else tar xzf radio-*.tar.gz -C verify; fi
-          ls -R verify
-          test -f verify/*/README.md
+          if [ "${{ matrix.archive }}" = "zip" ]; then 7z x -o"$verify" radio-*.zip >/dev/null; else tar xzf radio-*.tar.gz -C "$verify"; fi
+          ls -R "$verify"
+          test -f "$verify"/*/README.md
 
       - uses: actions/upload-artifact@v4
         with:

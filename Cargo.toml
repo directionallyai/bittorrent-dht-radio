@@ -1,6 +1,6 @@
 [package]
 name = "radio"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Recurring SSH-signed broadcasts over the BitTorrent mainline DHT (BEP 44), with circle listening"

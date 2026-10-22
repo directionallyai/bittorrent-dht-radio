@@ -35,11 +35,10 @@ sha2 = "0.10"
 ssh-agent-client-rs = "1.1"
 ssh-encoding = "0.2"
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "encryption", "getrandom"] }
+tempfile = "3"
 thiserror = "2"
 toml = "0.8"
 
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"

@@ -9,6 +9,8 @@ pub const ERROR: i32 = 1;
 pub const CONFIG: i32 = 3;
 /// Message invalid: empty, too large for a BEP 44 value (> 1000 bytes), or not valid text.
 pub const BAD_MESSAGE: i32 = 4;
+/// Nothing to republish, or the stored signed item has already expired.
+pub const STALE_ITEM: i32 = 5;
 /// Signing failed (SSH key unreadable, ssh-agent unreachable or identity missing, FIDO2 touch needed).
 pub const SIGNING: i32 = 6;
 /// `listen`: everything was reachable and verified, but there is no new message.

@@ -24,7 +24,7 @@ pub fn loopback_dht(bootstrap: &[String]) -> DhtConfig {
         include_default_bootstrap: false,
         bind_address: Some(Ipv4Addr::LOCALHOST),
         port: None,
-        request_timeout_ms: 500,
+        request_timeout_ms: 1000,
         bootstrap_attempts: 3,
         bootstrap_backoff_ms: 100,
         resolve_timeout_ms: 2000,

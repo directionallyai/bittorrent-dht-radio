@@ -228,6 +228,7 @@ fn rejections_over_a_real_dht_have_specific_diagnostics_and_exit_12() {
             } else {
                 "alice".into()
             },
+            to: None,
             seq,
             issued_at: now,
             expires_at: now + 600,

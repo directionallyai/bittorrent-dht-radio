@@ -158,6 +158,15 @@ pub struct PublishArgs {
     /// Do not include the previous-message hash
     #[arg(long)]
     pub no_prev: bool,
+    /// Send the message only to this pinned member, encrypted to their SSH key, in a separate
+    /// DHT slot that they check when listening (your broadcast is left unchanged)
+    #[arg(
+        long,
+        visible_alias = "to",
+        value_name = "NAME",
+        conflicts_with = "no_prev"
+    )]
+    pub publish_to: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -444,6 +453,29 @@ fn cmd_publish(paths: &Paths, a: PublishArgs, printer: &Printer) -> Result<i32, 
     };
     // Cheap local checks first: no signer prompt or network for an oversized message.
     let store = Store::new(paths);
+    if let Some(name) = &a.publish_to {
+        let circle = app::load_circle(paths)?;
+        let recipient = circle.find(name).ok_or_else(|| {
+            coded(
+                exit::CONFIG,
+                format!("no pinned member named {name:?} (see `radio circle list`)"),
+            )
+        })?;
+        ops::preflight_direct_for(&store, &cfg, recipient, &message, ttl.as_secs(), now_secs())?;
+        let ssh = app::load_signer(&cfg)?;
+        let dht_key = config::load_publisher_key(paths).code(exit::CONFIG)?;
+        let net = app::connect(&cfg, paths, note(printer))?;
+        let report = Publisher {
+            cfg: &cfg,
+            ssh: &ssh,
+            dht_key: &dht_key,
+            store: &store,
+        }
+        .publish_to(&net, recipient, &message, ttl.as_secs(), now_secs())?;
+        net.save_routing_cache();
+        printer.emit(&report.event());
+        return Ok(exit::OK);
+    }
     ops::preflight_for(
         &store,
         &cfg,
@@ -492,6 +524,15 @@ fn cmd_listen(paths: &Paths, a: ListenArgs, printer: &Printer) -> Result<i32, Co
     let circle = app::load_circle(paths)?;
     ops::require_circle(&circle)?;
     let store = Store::new(paths);
+    let inbox = match app::inbox(&cfg) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            printer.emit(&Event::Note {
+                detail: format!("not checking for direct messages: {e}"),
+            });
+            None
+        }
+    };
     let skew = cfg.clock_skew_secs;
     let interval = util::parse_duration(&a.interval).code(exit::CONFIG)?;
     let jitter = a
@@ -512,7 +553,15 @@ fn cmd_listen(paths: &Paths, a: ListenArgs, printer: &Printer) -> Result<i32, Co
             Ok(n) => Source::Live(n),
             Err(d) => Source::Down(d.clone()),
         };
-        let report = ops::poll_circle(&circle, &store, &source, now_secs(), skew, true)?;
+        let report = ops::poll_circle_with(
+            &circle,
+            &store,
+            &source,
+            inbox.as_ref(),
+            now_secs(),
+            skew,
+            true,
+        )?;
         for e in &report.events {
             printer.emit(e);
         }
@@ -538,7 +587,15 @@ fn cmd_listen(paths: &Paths, a: ListenArgs, printer: &Printer) -> Result<i32, Co
             None => Source::Down("DHT bootstrap failed; will retry".into()),
         };
         // The first pass reports everything; later passes only changes.
-        let report = ops::poll_circle(&circle, &store, &source, now_secs(), skew, first)?;
+        let report = ops::poll_circle_with(
+            &circle,
+            &store,
+            &source,
+            inbox.as_ref(),
+            now_secs(),
+            skew,
+            first,
+        )?;
         first = false;
         for e in &report.events {
             printer.emit(e);

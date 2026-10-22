@@ -3,6 +3,7 @@
 //! ```text
 //! radio/1
 //! from: alice
+//! to: SHA256:...               (direct messages only: the recipient's SSH fingerprint)
 //! seq: 1761142000
 //! iat: 1761142000
 //! exp: 1761145600
@@ -24,10 +25,14 @@ pub const PROTOCOL: &str = "radio/1";
 pub const MAX_NAME_LEN: usize = 32;
 /// Length of the hex `prev` field (first 8 bytes of the previous payload's SHA-256).
 pub const PREV_HEX_LEN: usize = 16;
+/// Length of an `SHA256:` SSH fingerprint (unpadded base64 of 32 bytes).
+pub const FINGERPRINT_LEN: usize = 7 + 43;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
     pub sender: String,
+    /// Direct messages only: the recipient's SSH fingerprint. `message` is then the ciphertext.
+    pub to: Option<String>,
     /// Must equal the BEP 44 `seq` of the item carrying this payload.
     pub seq: i64,
     /// Unix seconds, UTC.
@@ -53,6 +58,8 @@ pub enum PayloadError {
     BadSeq,
     #[error("prev must be {PREV_HEX_LEN} lowercase hex characters")]
     BadPrev,
+    #[error("recipient must be an SHA256: SSH fingerprint")]
+    BadRecipient,
     #[error("malformed payload: {0}")]
     Malformed(&'static str),
     #[error("unsupported payload version {0:?}")]
@@ -93,8 +100,22 @@ pub fn validate_message(message: &str) -> Result<(), PayloadError> {
 
 impl Payload {
     pub fn validate(&self) -> Result<(), PayloadError> {
+        self.validate_header()?;
+        validate_message(&self.message)
+    }
+
+    fn validate_header(&self) -> Result<(), PayloadError> {
         validate_name(&self.sender)?;
-        validate_message(&self.message)?;
+        if let Some(to) = &self.to {
+            let ok = to.len() == FINGERPRINT_LEN
+                && to.strip_prefix("SHA256:").is_some_and(|b| {
+                    b.bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
+                });
+            if !ok {
+                return Err(PayloadError::BadRecipient);
+            }
+        }
         if self.seq <= 0 {
             return Err(PayloadError::BadSeq);
         }
@@ -112,16 +133,28 @@ impl Payload {
 
     /// Canonical encoding (the bytes that get signed).
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
-        self.validate()?;
-        let mut s = format!(
-            "{PROTOCOL}\nfrom: {}\nseq: {}\niat: {}\nexp: {}\n",
-            self.sender, self.seq, self.issued_at, self.expires_at
-        );
+        validate_message(&self.message)?;
+        let mut bytes = self.header()?;
+        bytes.extend_from_slice(self.message.as_bytes());
+        Ok(bytes)
+    }
+
+    /// Canonical encoding up to and including the blank line before the message. A direct
+    /// message's ciphertext is bound to these bytes.
+    pub fn header(&self) -> Result<Vec<u8>, PayloadError> {
+        self.validate_header()?;
+        let mut s = format!("{PROTOCOL}\nfrom: {}\n", self.sender);
+        if let Some(to) = &self.to {
+            s.push_str(&format!("to: {to}\n"));
+        }
+        s.push_str(&format!(
+            "seq: {}\niat: {}\nexp: {}\n",
+            self.seq, self.issued_at, self.expires_at
+        ));
         if let Some(p) = &self.prev {
             s.push_str(&format!("prev: {p}\n"));
         }
         s.push('\n');
-        s.push_str(&self.message);
         Ok(s.into_bytes())
     }
 
@@ -131,7 +164,7 @@ impl Payload {
         let (head, message) = text
             .split_once("\n\n")
             .ok_or(PayloadError::Malformed("missing blank line before message"))?;
-        let mut lines = head.split('\n');
+        let mut lines = head.split('\n').peekable();
         let version = lines.next().unwrap_or_default();
         if version != PROTOCOL {
             return Err(PayloadError::UnsupportedVersion(
@@ -139,6 +172,10 @@ impl Payload {
             ));
         }
         let sender = field(lines.next(), "from: ")?.to_string();
+        let to = match lines.peek() {
+            Some(l) if l.starts_with("to: ") => Some(field(lines.next(), "to: ")?.to_string()),
+            _ => None,
+        };
         let seq = field(lines.next(), "seq: ")?
             .parse::<i64>()
             .map_err(|_| PayloadError::Malformed("seq is not an integer"))?;
@@ -157,6 +194,7 @@ impl Payload {
         }
         let payload = Payload {
             sender,
+            to,
             seq,
             issued_at,
             expires_at,
@@ -199,6 +237,7 @@ mod tests {
     fn sample() -> Payload {
         Payload {
             sender: "alice".into(),
+            to: None,
             seq: 7,
             issued_at: 1_700_000_000,
             expires_at: 1_700_003_600,
@@ -222,6 +261,29 @@ mod tests {
         assert_eq!(Payload::decode(&p.encode().unwrap()).unwrap(), p);
         p.prev = None;
         assert_eq!(Payload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn recipient_header_roundtrips_and_is_validated() {
+        let mut p = sample();
+        p.to = Some(format!("SHA256:{}", "A".repeat(43)));
+        let bytes = p.encode().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            text.starts_with("radio/1\nfrom: alice\nto: SHA256:AAAA"),
+            "{text}"
+        );
+        assert_eq!(Payload::decode(&bytes).unwrap(), p);
+        assert!(bytes.starts_with(&p.header().unwrap()));
+        assert_eq!(p.header().unwrap().len() + p.message.len(), bytes.len());
+        // A `to:` line after seq is out of order.
+        let moved = text.replace(
+            &format!("to: SHA256:{}\nseq: 7\n", "A".repeat(43)),
+            &format!("seq: 7\nto: SHA256:{}\n", "A".repeat(43)),
+        );
+        assert!(Payload::decode(moved.as_bytes()).is_err());
+        p.to = Some("SHA256:short".into());
+        assert_eq!(p.encode(), Err(PayloadError::BadRecipient));
     }
 
     #[test]

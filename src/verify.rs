@@ -64,6 +64,10 @@ pub enum Reject {
     MalformedPayload(String),
     #[error("sender mismatch: payload says {actual:?}, pinned member is {expected:?}")]
     SenderMismatch { expected: String, actual: String },
+    #[error("recipient mismatch: the payload is addressed to {actual}, expected {expected}")]
+    RecipientMismatch { expected: String, actual: String },
+    #[error("direct message from the pinned key does not decrypt with our SSH key: {0}")]
+    DecryptFailed(String),
     #[error("seq mismatch: payload seq {payload} != BEP 44 seq {item}")]
     SeqMismatch { item: i64, payload: i64 },
     #[error("issued-at {issued_at} ({issued}) is {ahead}s in the future, beyond the allowed clock skew of {skew}s (check both clocks)")]
@@ -98,6 +102,8 @@ impl Reject {
             Reject::SignerMismatch { .. } => "signer-mismatch",
             Reject::MalformedPayload(_) => "malformed-payload",
             Reject::SenderMismatch { .. } => "sender-mismatch",
+            Reject::RecipientMismatch { .. } => "recipient-mismatch",
+            Reject::DecryptFailed(_) => "decrypt-failed",
             Reject::SeqMismatch { .. } => "seq-mismatch",
             Reject::ClockSkew { .. } => "clock-skew",
             Reject::Rollback { .. } => "replay-rollback",
@@ -152,14 +158,57 @@ pub fn verify_for_member(
     now: u64,
     skew_secs: u64,
 ) -> Result<Verdict, Reject> {
+    verify_slot(
+        member,
+        member.salt.as_deref(),
+        None,
+        seen,
+        fetched,
+        now,
+        skew_secs,
+    )
+}
+
+/// Verify an item from `member`'s direct slot for us (`salt`, see
+/// [`crate::direct::slot_salt`]); the payload must be addressed to `our_fingerprint`. The
+/// accepted payload's message is still the ciphertext.
+pub fn verify_direct(
+    member: &Member,
+    salt: &str,
+    our_fingerprint: &str,
+    seen: &Seen,
+    fetched: &Fetched,
+    now: u64,
+    skew_secs: u64,
+) -> Result<Verdict, Reject> {
+    verify_slot(
+        member,
+        Some(salt),
+        Some(our_fingerprint),
+        seen,
+        fetched,
+        now,
+        skew_secs,
+    )
+}
+
+fn verify_slot(
+    member: &Member,
+    salt: Option<&str>,
+    to: Option<&str>,
+    seen: &Seen,
+    fetched: &Fetched,
+    now: u64,
+    skew_secs: u64,
+) -> Result<Verdict, Reject> {
     if member.dht_key().ok() != Some(fetched.key) {
         return Err(Reject::UnknownPublisher {
             key: hex::encode(fetched.key),
         });
     }
-    if member.salt.as_deref().map(str::as_bytes) != fetched.salt.as_deref() {
+    if salt.map(str::as_bytes) != fetched.salt.as_deref() {
         return Err(Reject::SaltMismatch {
-            expected: member.salt.clone(),
+            expected: salt.map(str::to_string),
             actual: fetched
                 .salt
                 .as_ref()
@@ -189,6 +238,12 @@ pub fn verify_for_member(
         return Err(Reject::SenderMismatch {
             expected: member.name.clone(),
             actual: payload.sender,
+        });
+    }
+    if payload.to.as_deref() != to {
+        return Err(Reject::RecipientMismatch {
+            expected: to.unwrap_or("everyone (broadcast)").to_string(),
+            actual: payload.to.unwrap_or_else(|| "everyone (broadcast)".into()),
         });
     }
     if payload.seq != fetched.seq {
@@ -379,6 +434,7 @@ mod tests {
         let s = setup();
         let payload = Payload {
             sender: "alice".into(),
+            to: None,
             seq: 4,
             issued_at: NOW,
             expires_at: NOW + 60,
@@ -497,6 +553,64 @@ mod tests {
         let same_seq_other_content = good(&s, 9, NOW - 10, 3600);
         let err = check(&s, &seen, &fetched(&same_seq_other_content, &s.alice)).unwrap_err();
         assert_eq!(err.code(), "seq-reuse");
+    }
+
+    #[test]
+    fn direct_items_only_verify_in_the_direct_slot_for_us() {
+        let s = setup();
+        let bob = Keys::new("bob");
+        let carol = Keys::new("carol");
+        let bob_fp = sshsig::fingerprint(bob.ssh.public());
+        let bob_salt = crate::direct::slot_salt(None, bob.ssh.public());
+        let b = s
+            .alice
+            .identity()
+            .build_direct(bob.ssh.public(), "hi bob", 4, NOW, 600)
+            .unwrap();
+        let f = Fetched {
+            salt: Some(bob_salt.clone().into_bytes()),
+            ..fetched(&b, &s.alice)
+        };
+        let member = &s.circle.members[0];
+        let v = verify_direct(member, &bob_salt, &bob_fp, &Seen::default(), &f, NOW, 120);
+        assert!(matches!(v, Ok(Verdict::New(_))), "{v:?}");
+
+        // Carol polling her own slot under alice's key must not accept bob's item.
+        let carol_salt = crate::direct::slot_salt(None, carol.ssh.public());
+        let carol_fp = sshsig::fingerprint(carol.ssh.public());
+        let err = verify_direct(
+            member,
+            &carol_salt,
+            &carol_fp,
+            &Seen::default(),
+            &f,
+            NOW,
+            120,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "salt-mismatch");
+        let moved = Fetched {
+            salt: Some(carol_salt.clone().into_bytes()),
+            ..f.clone()
+        };
+        let err = verify_direct(
+            member,
+            &carol_salt,
+            &carol_fp,
+            &Seen::default(),
+            &moved,
+            NOW,
+            120,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "recipient-mismatch");
+
+        // A direct payload placed in the broadcast slot is rejected too.
+        let broadcast = Fetched { salt: None, ..f };
+        assert_eq!(
+            check(&s, &Seen::default(), &broadcast).unwrap_err().code(),
+            "recipient-mismatch"
+        );
     }
 
     #[test]

@@ -19,6 +19,20 @@ pub struct State {
     pub publisher: PublisherState,
     #[serde(default)]
     pub dht: DhtState,
+    /// Direct messages received, per sender DHT key (hex).
+    #[serde(default)]
+    pub direct: BTreeMap<String, DirectState>,
+}
+
+/// What we accepted from one member's direct slot for us. Decrypted text is not stored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DirectState {
+    pub name: String,
+    /// Highest `seq` accepted from the slot. Anything lower is a rollback.
+    pub highest_seq: i64,
+    pub payload_sha256: Option<String>,
+    pub last_received_at: Option<u64>,
+    pub last_rejection: Option<Rejection>,
 }
 
 /// Verified message as stored for dedup and `status`.
@@ -112,6 +126,9 @@ pub struct PublisherState {
     pub last_put: Option<PutRecord>,
     pub last_publish_ok_at: Option<u64>,
     pub last_republish_ok_at: Option<u64>,
+    /// Last direct message sent to each recipient, keyed by their SSH fingerprint.
+    #[serde(default)]
+    pub direct: BTreeMap<String, SignedItem>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

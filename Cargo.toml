@@ -18,13 +18,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64ct = { version = "1", features = ["alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 ctrlc = { version = "3", features = ["termination"] }
+curve25519-dalek = { version = "4", default-features = false }
 directories = "6"
 ed25519-dalek = { version = "2", default-features = false }
 fd-lock = "4"
 futures-lite = "2"
 hex = "0.4"
+hkdf = "0.12"
 humantime = "2"
 mainline = "8"
 rand_core = { version = "0.6", features = ["getrandom"] }

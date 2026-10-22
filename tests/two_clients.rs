@@ -315,3 +315,90 @@ fn status_reports_members_and_put_results() {
         "{out:?}"
     );
 }
+
+#[test]
+fn publish_to_sends_an_encrypted_direct_message_only_the_recipient_can_read() {
+    let net = testnet();
+    let (a, b) = pair(&net);
+    let carol = Client::new("carol", &net.bootstrap);
+    carol.trust(&a);
+    a.trust(&carol);
+
+    assert_eq!(a.cli(&["publish", "--message", "hello all"]).code, exit::OK);
+    let out = a.cli(&[
+        "--json",
+        "publish",
+        "--publish-to",
+        "bob",
+        "--message",
+        "psst bob",
+    ]);
+    assert_eq!(out.code, exit::OK, "{out:?}");
+    let published = out.events_of("published");
+    assert_eq!(published[0]["kind"], "published-direct", "{out:?}");
+    assert_eq!(published[0]["to"], "bob");
+
+    // Bob sees both the broadcast and the decrypted direct message.
+    let out = b.cli(&["--json", "listen"]);
+    assert_eq!(out.code, exit::OK, "{out:?}");
+    assert_eq!(
+        out.events_of("message")[0]["message"],
+        "hello all",
+        "{out:?}"
+    );
+    let direct = out.events_of("direct-message");
+    assert_eq!(direct.len(), 1, "{out:?}");
+    assert_eq!(direct[0]["member"], "alice");
+    assert_eq!(direct[0]["message"], "psst bob");
+    assert!(out.events_of("rejected").is_empty(), "{out:?}");
+
+    // Shown once only.
+    let out = b.cli(&["--json", "listen"]);
+    assert_eq!(out.code, exit::NO_NEW, "{out:?}");
+    assert!(out.events_of("direct-message").is_empty(), "{out:?}");
+
+    // Carol listens to alice too, but has no direct message and sees nothing odd.
+    let out = carol.cli(&["--json", "listen"]);
+    assert_eq!(out.code, exit::OK, "{out:?}");
+    assert!(out.events_of("direct-message").is_empty(), "{out:?}");
+    assert!(out.events_of("rejected").is_empty(), "{out:?}");
+    assert_eq!(out.events_of("message")[0]["message"], "hello all");
+
+    // Human-readable form.
+    assert_eq!(
+        a.cli(&["publish", "--to", "bob", "--message", "second"])
+            .code,
+        exit::OK
+    );
+    let out = b.cli(&["listen"]);
+    assert_eq!(out.code, exit::OK, "{out:?}");
+    assert!(out.stdout.contains("alice -> you: second"), "{out:?}");
+    // The plaintext is not kept in the receiver's state.
+    let state = std::fs::read_to_string(b.paths.state_file()).unwrap();
+    assert!(
+        !state.contains("second") && !state.contains("psst"),
+        "{state}"
+    );
+}
+
+#[test]
+fn publish_to_checks_the_recipient_and_size_before_signing() {
+    let net = testnet();
+    let (a, _b) = pair(&net);
+    let out = a.cli(&["publish", "--publish-to", "nobody", "--message", "x"]);
+    assert_eq!(out.code, exit::CONFIG, "{out:?}");
+    assert!(out.stderr.contains("no pinned member"), "{out:?}");
+
+    let out = a.cli(&[
+        "publish",
+        "--publish-to",
+        "bob",
+        "--message",
+        &"x".repeat(600),
+    ]);
+    assert_eq!(out.code, exit::BAD_MESSAGE, "{out:?}");
+    assert!(
+        out.stderr.contains("direct message is 600 bytes"),
+        "{out:?}"
+    );
+}

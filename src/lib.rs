@@ -3,6 +3,7 @@ pub mod circle;
 pub mod cli;
 pub mod config;
 pub mod diag;
+pub mod direct;
 pub mod exit;
 pub mod item;
 pub mod net;

@@ -150,6 +150,8 @@ pub fn run(
     };
     let publisher = &publisher_owned;
     let skew = cfg.clock_skew_secs;
+    let inbox_owned = ops::Inbox::for_signer(ssh);
+    let inbox = &inbox_owned;
 
     std::thread::scope(|scope| {
         // Publisher: fresh signature (new seq, new issued-at) every interval.
@@ -201,7 +203,15 @@ pub fn run(
                 Some(n) => Source::Live(n),
                 None => Source::Down(down),
             };
-            match ops::poll_circle(circle, store, &source, now_secs(), skew, false) {
+            match ops::poll_circle_with(
+                circle,
+                store,
+                &source,
+                Some(inbox),
+                now_secs(),
+                skew,
+                false,
+            ) {
                 Ok(report) => {
                     for e in &report.events {
                         printer.emit(e);

@@ -3,8 +3,11 @@
 use mainline::{MutableItem, SigningKey};
 use thiserror::Error;
 
+use ssh_key::PublicKey;
+
+use crate::direct::{self, DirectError};
 use crate::item::{self, ItemError};
-use crate::payload::{Payload, PayloadError};
+use crate::payload::{validate_message, Payload, PayloadError};
 use crate::sshsig::{self, SignError, Signer};
 
 #[derive(Debug, Error)]
@@ -15,13 +18,23 @@ pub enum BuildError {
     Size(#[from] ItemError),
     #[error(transparent)]
     Sign(#[from] SignError),
+    #[error(transparent)]
+    Direct(#[from] DirectError),
+    #[error(
+        "direct message is {len} bytes; at most {max} bytes fit once it is encrypted and base64-encoded \
+         into a signed BEP 44 value (1000 bytes)"
+    )]
+    DirectTooLarge { len: usize, max: usize },
 }
 
 impl BuildError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            BuildError::Payload(_) | BuildError::Size(_) => crate::exit::BAD_MESSAGE,
+            BuildError::Payload(_) | BuildError::Size(_) | BuildError::DirectTooLarge { .. } => {
+                crate::exit::BAD_MESSAGE
+            }
             BuildError::Sign(_) => crate::exit::SIGNING,
+            BuildError::Direct(_) => crate::exit::CONFIG,
         }
     }
 }
@@ -55,24 +68,98 @@ impl Identity<'_> {
     ) -> Result<Built, BuildError> {
         let payload = Payload {
             sender: self.name.to_string(),
+            to: None,
             seq,
             issued_at: now,
             expires_at: now.saturating_add(ttl_secs.max(1)),
             prev,
             message: message.to_string(),
         };
+        self.sign_and_wrap(payload, self.salt.map(str::as_bytes))
+    }
+
+    /// Encrypt `message` to `to` and sign it as sequence number `seq` of the direct slot for
+    /// that recipient (see [`direct::slot_salt`]). The size limit is enforced before signing.
+    pub fn build_direct(
+        &self,
+        to: &PublicKey,
+        message: &str,
+        seq: i64,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Built, BuildError> {
+        let payload = seal_payload(self.name, to, message, seq, now, ttl_secs)?;
+        let salt = direct::slot_salt(self.salt, to);
+        self.sign_and_wrap(payload, Some(salt.as_bytes()))
+    }
+
+    fn sign_and_wrap(&self, payload: Payload, salt: Option<&[u8]>) -> Result<Built, BuildError> {
         let bytes = payload.encode()?;
         item::check_payload_fits(bytes.len())?;
         let sig = self.ssh.sign(&bytes)?;
         let blob = sshsig::sig_to_blob(&sig)?;
         let value = item::encode_value(&bytes, &blob)?;
-        let item = MutableItem::new(self.dht.clone(), &value, seq, self.salt.map(str::as_bytes));
+        let item = MutableItem::new(self.dht.clone(), &value, payload.seq, salt);
         Ok(Built {
             payload,
             value,
             item,
         })
     }
+}
+
+/// The payload of a direct message: `to:` header, and `message` encrypted to `to` with the
+/// header as associated data. Needs no signer, so it doubles as the preflight size check.
+pub fn seal_payload(
+    sender: &str,
+    to: &PublicKey,
+    message: &str,
+    seq: i64,
+    now: u64,
+    ttl_secs: u64,
+) -> Result<Payload, BuildError> {
+    validate_message(message)?;
+    let mut payload = Payload {
+        sender: sender.to_string(),
+        to: Some(sshsig::fingerprint(to)),
+        seq,
+        issued_at: now,
+        expires_at: now.saturating_add(ttl_secs.max(1)),
+        prev: None,
+        message: String::new(),
+    };
+    let header = payload.header()?;
+    if item::predicted_raw_len(header.len() + direct::sealed_len(message.len())) > item::MAX_RAW_V {
+        return Err(BuildError::DirectTooLarge {
+            len: message.len(),
+            max: max_direct_message_bytes(sender, to, seq, now, ttl_secs),
+        });
+    }
+    payload.message = direct::seal(to, &header, message.as_bytes())?;
+    Ok(payload)
+}
+
+/// Largest direct message (plaintext bytes) that fits once encrypted, base64-encoded and signed.
+pub fn max_direct_message_bytes(
+    sender: &str,
+    to: &PublicKey,
+    seq: i64,
+    now: u64,
+    ttl_secs: u64,
+) -> usize {
+    let header = Payload {
+        sender: sender.to_string(),
+        to: Some(sshsig::fingerprint(to)),
+        seq,
+        issued_at: now,
+        expires_at: now + ttl_secs.max(1),
+        prev: None,
+        message: String::new(),
+    }
+    .header()
+    .map(|h| h.len())
+    .unwrap_or(0);
+    direct::max_plaintext(item::MAX_RAW_V.saturating_sub(2 + item::ed25519_sshsig_len() + header))
 }
 
 /// Next sequence number for the feed: strictly above everything known, and never below the
@@ -92,6 +179,7 @@ pub fn max_message_bytes(
 ) -> usize {
     let one_byte = Payload {
         sender: sender.to_string(),
+        to: None,
         seq,
         issued_at: now,
         expires_at: now + ttl_secs.max(1),
@@ -230,6 +318,68 @@ mod tests {
         let too_big = "\u{1F4E1}".repeat(max / 4 + 1);
         assert!(too_big.len() > max);
         assert!(k.identity().build(&too_big, seq, now, ttl, None).is_err());
+    }
+
+    #[test]
+    fn direct_item_is_signed_encrypted_and_in_its_own_slot() {
+        let (alice, bob) = (Keys::new("alice"), Keys::new("bob"));
+        let built = alice
+            .identity()
+            .build_direct(bob.ssh.public(), "psst", 9, 1000, 600)
+            .unwrap();
+        let salt = direct::slot_salt(None, bob.ssh.public());
+        assert_eq!(built.item.salt(), Some(salt.as_bytes()));
+        let (payload, blob) = item::decode_value(&built.value).unwrap();
+        assert_eq!(
+            sshsig::verify_blob(alice.ssh.public(), payload, blob),
+            Ok(())
+        );
+        let p = Payload::decode(payload).unwrap();
+        assert_eq!(
+            p.to.as_deref(),
+            Some(&*sshsig::fingerprint(bob.ssh.public()))
+        );
+        assert!(!p.message.contains("psst"));
+        let Signer::File { key, .. } = &bob.ssh else {
+            unreachable!()
+        };
+        let opener = direct::Opener::from_private_key(key).unwrap();
+        assert_eq!(
+            opener.open(&p.header().unwrap(), &p.message).unwrap(),
+            b"psst"
+        );
+    }
+
+    #[test]
+    fn direct_size_boundary_is_checked_before_signing() {
+        let (alice, bob) = (Keys::new("alice"), Keys::new("bob"));
+        let (seq, now, ttl) = (1_700_000_000i64, 1_700_000_000u64, 3600u64);
+        let max = max_direct_message_bytes("alice", bob.ssh.public(), seq, now, ttl);
+        assert!(max > 400, "room for real messages: {max}");
+        let ok = alice
+            .identity()
+            .build_direct(bob.ssh.public(), &"a".repeat(max), seq, now, ttl)
+            .unwrap();
+        assert!(bencoded_len(ok.value.len()) <= MAX_V_BENCODED);
+        let agent = Signer::Agent {
+            socket: "/nonexistent/agent.sock".into(),
+            public: alice.ssh.public().clone(),
+        };
+        let id = Identity {
+            name: "alice",
+            salt: None,
+            ssh: &agent,
+            dht: &alice.dht,
+        };
+        let err = id
+            .build_direct(bob.ssh.public(), &"a".repeat(max + 1), seq, now, ttl)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, BuildError::DirectTooLarge { .. }),
+            "got {err}"
+        );
+        assert_eq!(err.exit_code(), crate::exit::BAD_MESSAGE);
     }
 
     #[test]

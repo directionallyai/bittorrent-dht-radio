@@ -1,19 +1,24 @@
 //! The operations behind the commands: publish, republish and poll the circle.
 
+use std::sync::OnceLock;
+
 use anyhow::anyhow;
 use mainline::SigningKey;
+use ssh_key::PublicKey;
 
 use crate::circle::{Circle, Member};
 use crate::config::Config;
+use crate::direct::{self, Opener};
 use crate::exit::{self, coded, Coded, WithCode};
 use crate::item::bencoded_len;
 use crate::net::{Net, PutFailure};
 use crate::output::Event;
-use crate::payload::Payload;
-use crate::publish::{self, BuildError, Identity};
-use crate::sshsig::Signer;
+use crate::payload::{validate_message, Payload};
+use crate::publish::{self, BuildError, Built, Identity};
+use crate::sshsig::{self, Signer};
 use crate::state::{
-    MemberState, MemberStatus, PutRecord, Rejection, SignedItem, State, Store, StoredMessage,
+    DirectState, MemberState, MemberStatus, PutRecord, Rejection, SignedItem, State, Store,
+    StoredMessage,
 };
 use crate::util::{format_age, format_utc};
 use crate::verify::{self, Accepted, Fetched, Reject, Seen, Verdict};
@@ -56,6 +61,8 @@ pub struct Publisher<'a> {
 #[derive(Debug, Clone)]
 pub struct PublishReport {
     pub kind: &'static str,
+    /// Recipient name, for a direct message.
+    pub to: Option<String>,
     pub seq: i64,
     pub issued_at: u64,
     pub expires_at: u64,
@@ -67,12 +74,20 @@ impl PublishReport {
     pub fn event(&self) -> Event {
         Event::Published {
             kind: self.kind.into(),
+            to: self.to.clone(),
             seq: self.seq,
             issued_at: self.issued_at,
             expires_at: self.expires_at,
             stored_at: self.stored_at,
             bytes_bencoded: self.bytes_bencoded,
         }
+    }
+}
+
+fn build_error_to_coded(e: BuildError) -> Coded {
+    Coded {
+        code: e.exit_code(),
+        error: e.into(),
     }
 }
 
@@ -144,108 +159,165 @@ impl Publisher<'_> {
             ttl_secs,
             prev.is_some(),
         )
-        .map_err(|e: BuildError| Coded {
-            code: e.exit_code(),
-            error: e.into(),
-        })?;
+        .map_err(build_error_to_coded)?;
 
-        // Learn the highest seq already on the DHT so ours is above it (state may have been lost).
-        let own_key = self.dht_key.verifying_key().to_bytes();
-        let on_dht = net
-            .get_latest(&own_key, self.cfg.salt.as_deref().map(str::as_bytes))
-            .item
-            .map(|i| i.seq());
-        let mut known_max = match (local_last, on_dht) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
-
-        let mut cas = on_dht;
-        let mut last_err = None;
-        for _ in 0..=MAX_CONFLICT_RETRIES {
-            let seq = publish::next_seq(known_max, now);
-            let built = ident
-                .build(message, seq, now, ttl_secs, prev.clone())
-                .map_err(|e: BuildError| Coded {
-                    code: e.exit_code(),
-                    error: e.into(),
-                })?;
-            match put_resilient(net, built.item.clone(), cas) {
-                Ok(stored_at) => {
-                    let bytes = bencoded_len(built.value.len());
-                    let sha = hex::encode(built.payload.hash());
-                    record_put(
-                        self.store,
-                        PutRecord {
-                            at: now,
-                            kind: "publish".into(),
-                            seq,
-                            ok: true,
-                            stored_at: Some(stored_at),
-                            error: None,
-                        },
-                        Some(SignedItem {
-                            seq,
-                            value_hex: hex::encode(&built.value),
-                            salt: self.cfg.salt.clone(),
-                            issued_at: built.payload.issued_at,
-                            expires_at: built.payload.expires_at,
-                            payload_sha256: sha,
-                            message: message.to_string(),
-                        }),
-                        false,
-                    );
-                    return Ok(PublishReport {
-                        kind: "published",
-                        seq,
-                        issued_at: built.payload.issued_at,
-                        expires_at: built.payload.expires_at,
-                        stored_at,
-                        bytes_bencoded: bytes,
-                    });
-                }
-                Err(PutFailure::Conflict(c)) => {
-                    // Someone (or a stale replica) holds a different seq: re-read and go above it.
-                    let latest = net
-                        .get_latest(&own_key, self.cfg.salt.as_deref().map(str::as_bytes))
-                        .item
-                        .map(|i| i.seq());
-                    known_max = known_max.max(latest);
-                    cas = latest;
-                    last_err = Some(PutFailure::Conflict(c));
-                }
-                Err(e) => {
-                    record_put(
-                        self.store,
-                        PutRecord {
-                            at: now,
-                            kind: "publish".into(),
-                            seq,
-                            ok: false,
-                            stored_at: None,
-                            error: Some(e.to_string()),
-                        },
-                        None,
-                        false,
-                    );
-                    return Err(put_error_to_coded(e));
-                }
-            }
-        }
-        let e = last_err.expect("loop ran at least once");
+        let (built, stored_at) = self.put_fresh(
+            net,
+            self.cfg.salt.as_deref().map(str::as_bytes),
+            local_last,
+            "publish",
+            now,
+            |seq| ident.build(message, seq, now, ttl_secs, prev.clone()),
+        )?;
+        let seq = built.payload.seq;
         record_put(
             self.store,
             PutRecord {
                 at: now,
                 kind: "publish".into(),
-                seq: 0,
-                ok: false,
-                stored_at: None,
-                error: Some(e.to_string()),
+                seq,
+                ok: true,
+                stored_at: Some(stored_at),
+                error: None,
             },
-            None,
+            Some(SignedItem {
+                seq,
+                value_hex: hex::encode(&built.value),
+                salt: self.cfg.salt.clone(),
+                issued_at: built.payload.issued_at,
+                expires_at: built.payload.expires_at,
+                payload_sha256: hex::encode(built.payload.hash()),
+                message: message.to_string(),
+            }),
             false,
         );
+        Ok(PublishReport {
+            kind: "published",
+            to: None,
+            seq,
+            issued_at: built.payload.issued_at,
+            expires_at: built.payload.expires_at,
+            stored_at,
+            bytes_bencoded: bencoded_len(built.value.len()),
+        })
+    }
+
+    /// Encrypt `message` to `recipient`'s SSH key, sign it, and put it in our direct slot for
+    /// them. The broadcast feed is left alone. The size limit is checked before signing.
+    pub fn publish_to(
+        &self,
+        net: &Net,
+        recipient: &Member,
+        message: &str,
+        ttl_secs: u64,
+        now: u64,
+    ) -> Result<PublishReport, Coded> {
+        let to = recipient.ssh_key().code(exit::CONFIG)?;
+        let fingerprint = sshsig::fingerprint(&to);
+        let state = self.store.load().code(exit::ERROR)?;
+        let local_last = state.publisher.direct.get(&fingerprint).map(|i| i.seq);
+        let ident = self.identity();
+        preflight_direct(ident.name, &to, message, local_last, ttl_secs, now)?;
+
+        let salt = direct::slot_salt(self.cfg.salt.as_deref(), &to);
+        let (built, stored_at) = self.put_fresh(
+            net,
+            Some(salt.as_bytes()),
+            local_last,
+            "direct",
+            now,
+            |seq| ident.build_direct(&to, message, seq, now, ttl_secs),
+        )?;
+        let seq = built.payload.seq;
+        let _ = self.store.update(|s| {
+            s.publisher.last_put = Some(PutRecord {
+                at: now,
+                kind: "direct".into(),
+                seq,
+                ok: true,
+                stored_at: Some(stored_at),
+                error: None,
+            });
+            s.publisher.direct.insert(
+                fingerprint,
+                SignedItem {
+                    seq,
+                    value_hex: hex::encode(&built.value),
+                    salt: Some(salt.clone()),
+                    issued_at: built.payload.issued_at,
+                    expires_at: built.payload.expires_at,
+                    payload_sha256: hex::encode(built.payload.hash()),
+                    message: message.to_string(),
+                },
+            );
+        });
+        Ok(PublishReport {
+            kind: "published-direct",
+            to: Some(recipient.name.clone()),
+            seq,
+            issued_at: built.payload.issued_at,
+            expires_at: built.payload.expires_at,
+            stored_at,
+            bytes_bencoded: bencoded_len(built.value.len()),
+        })
+    }
+
+    /// Sign with `build` and put into the slot `salt` of our feed key. The seq goes above both
+    /// local state and whatever the DHT holds (state may have been lost); after a BEP 44 write
+    /// conflict it re-reads and re-signs. Failed puts are recorded as `kind`.
+    fn put_fresh(
+        &self,
+        net: &Net,
+        salt: Option<&[u8]>,
+        local_last: Option<i64>,
+        kind: &str,
+        now: u64,
+        build: impl Fn(i64) -> Result<Built, BuildError>,
+    ) -> Result<(Built, u32), Coded> {
+        let own_key = self.dht_key.verifying_key().to_bytes();
+        let on_dht = net.get_latest(&own_key, salt).item.map(|i| i.seq());
+        let mut known_max = match (local_last, on_dht) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+
+        let fail = |seq, e: &PutFailure| {
+            record_put(
+                self.store,
+                PutRecord {
+                    at: now,
+                    kind: kind.into(),
+                    seq,
+                    ok: false,
+                    stored_at: None,
+                    error: Some(e.to_string()),
+                },
+                None,
+                false,
+            )
+        };
+        let mut cas = on_dht;
+        let mut last_err = None;
+        for _ in 0..=MAX_CONFLICT_RETRIES {
+            let seq = publish::next_seq(known_max, now);
+            let built = build(seq).map_err(build_error_to_coded)?;
+            match put_resilient(net, built.item.clone(), cas) {
+                Ok(stored_at) => return Ok((built, stored_at)),
+                Err(PutFailure::Conflict(c)) => {
+                    // Someone (or a stale replica) holds a different seq: re-read and go above it.
+                    let latest = net.get_latest(&own_key, salt).item.map(|i| i.seq());
+                    known_max = known_max.max(latest);
+                    cas = latest;
+                    last_err = Some(PutFailure::Conflict(c));
+                }
+                Err(e) => {
+                    fail(seq, &e);
+                    return Err(put_error_to_coded(e));
+                }
+            }
+        }
+        let e = last_err.expect("loop ran at least once");
+        fail(0, &e);
         Err(put_error_to_coded(e))
     }
 }
@@ -303,6 +375,7 @@ pub fn republish(
             );
             Ok(PublishReport {
                 kind: "republished",
+                to: None,
                 seq: item.seq,
                 issued_at: item.issued_at,
                 expires_at: item.expires_at,
@@ -355,6 +428,46 @@ pub fn preflight_for(
     })
 }
 
+/// Validate, encrypt and size-check a direct message without signing anything.
+pub fn preflight_direct(
+    name: &str,
+    to: &PublicKey,
+    message: &str,
+    local_last: Option<i64>,
+    ttl_secs: u64,
+    now: u64,
+) -> Result<(), Coded> {
+    publish::seal_payload(
+        name,
+        to,
+        message,
+        publish::next_seq(local_last, now),
+        now,
+        ttl_secs,
+    )
+    .map(|_| ())
+    .map_err(build_error_to_coded)
+}
+
+/// Like [`preflight_direct`], using the saved state for the next seq.
+pub fn preflight_direct_for(
+    store: &Store,
+    cfg: &Config,
+    recipient: &Member,
+    message: &str,
+    ttl_secs: u64,
+    now: u64,
+) -> Result<(), Coded> {
+    let to = recipient.ssh_key().code(exit::CONFIG)?;
+    let state = store.load().code(exit::ERROR)?;
+    let last = state
+        .publisher
+        .direct
+        .get(&sshsig::fingerprint(&to))
+        .map(|i| i.seq);
+    preflight_direct(&cfg.name, &to, message, last, ttl_secs, now)
+}
+
 /// Validate and size-check a message without signing anything.
 pub fn preflight(
     name: &str,
@@ -366,6 +479,7 @@ pub fn preflight(
 ) -> Result<(), BuildError> {
     let p = Payload {
         sender: name.to_string(),
+        to: None,
         seq,
         issued_at: now,
         expires_at: now.saturating_add(ttl_secs.max(1)),
@@ -465,6 +579,11 @@ pub struct PollReport {
 }
 
 pub fn fetch_member(source: &Source, member: &Member) -> Fetch {
+    fetch_slot(source, member, member.salt_bytes())
+}
+
+/// Fetch the item stored under `member`'s feed key with `salt`.
+pub fn fetch_slot(source: &Source, member: &Member, salt: Option<&[u8]>) -> Fetch {
     match source {
         Source::Down(d) => Fetch::Unreachable(d.clone()),
         Source::Live(net) => {
@@ -472,7 +591,7 @@ pub fn fetch_member(source: &Source, member: &Member) -> Fetch {
                 Ok(k) => k,
                 Err(e) => return Fetch::Unreachable(format!("invalid pinned key: {e}")),
             };
-            let res = net.get_latest(&key, member.salt_bytes());
+            let res = net.get_latest(&key, salt);
             match res.item {
                 Some(item) => Fetch::Found(Fetched::from(&item)),
                 None if res.outcome.responded() == 0 => Fetch::Unreachable(format!(
@@ -489,6 +608,60 @@ pub fn fetch_member(source: &Source, member: &Member) -> Fetch {
     }
 }
 
+/// Our side of direct messages: the SSH key they are encrypted to, and the decryptor, which
+/// is loaded only once a new direct message actually arrives (it may need a passphrase).
+pub struct Inbox {
+    public: PublicKey,
+    fingerprint: String,
+    opener: OnceLock<Result<Opener, String>>,
+    load: Box<dyn Fn() -> Result<Opener, String> + Send + Sync>,
+}
+
+impl Inbox {
+    pub fn new(
+        public: PublicKey,
+        load: impl Fn() -> Result<Opener, String> + Send + Sync + 'static,
+    ) -> Self {
+        Inbox {
+            fingerprint: sshsig::fingerprint(&public),
+            public,
+            opener: OnceLock::new(),
+            load: Box::new(load),
+        }
+    }
+
+    /// An inbox for the key `signer` signs with. ssh-agent keys can sign but not decrypt.
+    pub fn for_signer(signer: &Signer) -> Self {
+        let inbox = Inbox::new(signer.public().clone(), || Err(AGENT_CANNOT_DECRYPT.into()));
+        if let Signer::File { key, .. } = signer {
+            let _ = inbox
+                .opener
+                .set(Opener::from_private_key(key).map_err(|e| e.to_string()));
+        }
+        inbox
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Salt of `member`'s direct slot for us.
+    pub fn slot_salt(&self, member: &Member) -> String {
+        direct::slot_salt(member.salt.as_deref(), &self.public)
+    }
+
+    fn opener(&self) -> Result<&Opener, &str> {
+        self.opener
+            .get_or_init(|| (self.load)())
+            .as_ref()
+            .map_err(String::as_str)
+    }
+}
+
+pub const AGENT_CANNOT_DECRYPT: &str =
+    "your SSH key is used through ssh-agent, which can sign but \
+     cannot decrypt; direct messages need the private key file (`radio init --ssh-key`)";
+
 /// Poll every circle member once, update persistent state and return the events to show.
 ///
 /// With `emit_all` (one-shot `listen`) every non-OK member is reported each time; otherwise
@@ -501,21 +674,62 @@ pub fn poll_circle(
     skew: u64,
     emit_all: bool,
 ) -> Result<PollReport, Coded> {
-    // Query all members concurrently; the DHT handle is shared.
-    let fetches: Vec<Fetch> = std::thread::scope(|scope| {
+    poll_circle_with(circle, store, source, None, now, skew, emit_all)
+}
+
+/// [`poll_circle`], also checking each member's direct slot for `inbox`.
+pub fn poll_circle_with(
+    circle: &Circle,
+    store: &Store,
+    source: &Source,
+    inbox: Option<&Inbox>,
+    now: u64,
+    skew: u64,
+    emit_all: bool,
+) -> Result<PollReport, Coded> {
+    let salts: Vec<Option<String>> = circle
+        .members
+        .iter()
+        .map(|m| inbox.map(|i| i.slot_salt(m)))
+        .collect();
+    let join = |h: std::thread::ScopedJoinHandle<'_, Fetch>| {
+        h.join()
+            .unwrap_or_else(|_| Fetch::Unreachable("poll thread panicked".into()))
+    };
+    // Query all members (and their direct slots for us) concurrently; the DHT handle is shared.
+    let (fetches, direct_fetches): (Vec<Fetch>, Vec<Option<Fetch>>) = std::thread::scope(|scope| {
         let handles: Vec<_> = circle
             .members
             .iter()
-            .map(|m| scope.spawn(move || fetch_member(source, m)))
+            .zip(&salts)
+            .map(|(m, salt)| {
+                (
+                    scope.spawn(move || fetch_member(source, m)),
+                    salt.as_ref()
+                        .map(|s| scope.spawn(move || fetch_slot(source, m, Some(s.as_bytes())))),
+                )
+            })
             .collect();
         handles
             .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Fetch::Unreachable("poll thread panicked".into()))
-            })
-            .collect()
+            .map(|(h, d)| (join(h), d.map(join)))
+            .unzip()
     });
+
+    // Load the decryptor (which may prompt for a passphrase) before taking the state lock.
+    if let Some(inbox) = inbox {
+        let state = store.load().code(exit::ERROR)?;
+        let pending = circle.members.iter().zip(&direct_fetches).any(|(m, f)| {
+            let seen = state
+                .direct
+                .get(&m.dht_public_key)
+                .map_or(0, |d| d.highest_seq);
+            matches!(f, Some(Fetch::Found(f)) if f.seq > seen)
+        });
+        if pending {
+            let _ = inbox.opener();
+        }
+    }
 
     let mut events = Vec::new();
     let mut summary = PollSummary {
@@ -524,7 +738,13 @@ pub fn poll_circle(
     };
     store
         .update(|state| {
-            for (member, fetch) in circle.members.iter().zip(fetches) {
+            for (((member, fetch), direct_fetch), salt) in circle
+                .members
+                .iter()
+                .zip(fetches)
+                .zip(direct_fetches)
+                .zip(&salts)
+            {
                 let key = member.dht_public_key.clone();
                 let prev = state.members.get(&key).cloned().unwrap_or_default();
                 let outcome = evaluate(member, &prev, fetch, now, skew);
@@ -538,6 +758,18 @@ pub fn poll_circle(
                     &mut events,
                     &mut summary,
                 );
+                if let (Some(inbox), Some(Fetch::Found(f)), Some(salt)) =
+                    (inbox, direct_fetch, salt)
+                {
+                    let ctx = DirectCtx {
+                        inbox,
+                        salt,
+                        now,
+                        skew,
+                        emit_all,
+                    };
+                    apply_direct(state, member, &f, &ctx, &mut events, &mut summary);
+                }
             }
         })
         .code(exit::ERROR)?;
@@ -659,6 +891,136 @@ fn apply_outcome(
         });
     }
     state.members.insert(member.dht_public_key.clone(), ms);
+}
+
+struct DirectCtx<'a> {
+    inbox: &'a Inbox,
+    salt: &'a str,
+    now: u64,
+    skew: u64,
+    emit_all: bool,
+}
+
+enum DirectOutcome {
+    New(Accepted, String),
+    Seen,
+    Rejected(Reject),
+    /// Verified, but our private key is not available to decrypt it (yet).
+    NoKey(String),
+}
+
+fn open_direct(inbox: &Inbox, a: &Accepted) -> DirectOutcome {
+    let opener = match inbox.opener() {
+        Ok(o) => o,
+        Err(e) => return DirectOutcome::NoKey(e.to_string()),
+    };
+    let header = a
+        .payload
+        .header()
+        .expect("verified payload has a valid header");
+    let text = match opener.open(&header, &a.payload.message) {
+        Ok(bytes) => bytes,
+        Err(e) => return DirectOutcome::Rejected(Reject::DecryptFailed(e.to_string())),
+    };
+    let text = match String::from_utf8(text) {
+        Ok(t) => t,
+        Err(_) => {
+            return DirectOutcome::Rejected(Reject::MalformedPayload(
+                "decrypted message is not valid UTF-8".into(),
+            ))
+        }
+    };
+    match validate_message(&text) {
+        Ok(()) => DirectOutcome::New(a.clone(), text),
+        Err(e) => {
+            DirectOutcome::Rejected(Reject::MalformedPayload(format!("decrypted message: {e}")))
+        }
+    }
+}
+
+/// Handle what was found in `member`'s direct slot for us. Nothing there, or an expired item,
+/// is normal and silent; reachability is already reported for the member's feed.
+fn apply_direct(
+    state: &mut State,
+    member: &Member,
+    fetched: &Fetched,
+    ctx: &DirectCtx,
+    events: &mut Vec<Event>,
+    summary: &mut PollSummary,
+) {
+    let mut ds: DirectState = state
+        .direct
+        .get(&member.dht_public_key)
+        .cloned()
+        .unwrap_or_default();
+    ds.name = member.name.clone();
+    let seen = Seen {
+        highest_seq: ds.highest_seq,
+        payload_sha256: ds.payload_sha256.clone(),
+    };
+    let fp = ctx.inbox.fingerprint();
+    let outcome =
+        match verify::verify_direct(member, ctx.salt, fp, &seen, fetched, ctx.now, ctx.skew) {
+            Ok(Verdict::New(a)) => open_direct(ctx.inbox, &a),
+            Ok(Verdict::Seen(_)) => DirectOutcome::Seen,
+            Err(r) if r.is_soft() => DirectOutcome::Seen,
+            Err(r) => DirectOutcome::Rejected(r),
+        };
+    let rejection = match outcome {
+        DirectOutcome::Seen => None,
+        DirectOutcome::New(a, text) => {
+            let p = &a.payload;
+            ds.highest_seq = p.seq;
+            ds.payload_sha256 = Some(a.payload_sha256.clone());
+            ds.last_received_at = Some(ctx.now);
+            ds.last_rejection = None;
+            summary.new += 1;
+            events.push(Event::DirectMessage {
+                member: member.name.clone(),
+                seq: p.seq,
+                issued_at: p.issued_at,
+                expires_at: p.expires_at,
+                message: text,
+                ssh_fingerprint: member.ssh_fingerprint(),
+                fetched_at: ctx.now,
+            });
+            None
+        }
+        DirectOutcome::Rejected(r) => {
+            summary.rejected += 1;
+            Some(Rejection {
+                at: ctx.now,
+                reason: r.code().into(),
+                detail: r.to_string(),
+            })
+        }
+        // The seq is not advanced, so the message is decrypted once the key is available.
+        DirectOutcome::NoKey(why) => Some(Rejection {
+            at: ctx.now,
+            reason: "no-decryption-key".into(),
+            detail: format!("a direct message is waiting but cannot be decrypted: {why}"),
+        }),
+    };
+    if let Some(rej) = rejection {
+        let repeated = ds
+            .last_rejection
+            .as_ref()
+            .is_some_and(|p| p.reason == rej.reason && p.detail == rej.detail);
+        if (ctx.emit_all || !repeated) && rej.reason == "no-decryption-key" {
+            events.push(Event::Error {
+                context: format!("direct message from {}", member.name),
+                detail: rej.detail.clone(),
+            });
+        } else if ctx.emit_all || !repeated {
+            events.push(Event::Rejected {
+                member: format!("{} (direct)", member.name),
+                reason: rej.reason.clone(),
+                detail: rej.detail.clone(),
+            });
+        }
+        ds.last_rejection = Some(rej);
+    }
+    state.direct.insert(member.dht_public_key.clone(), ds);
 }
 
 /// Human description of how stale a member is, for `status`.
@@ -929,6 +1291,59 @@ mod tests {
         assert_eq!(s(1, 1, 0).exit_code(), exit::OK);
         assert_eq!(s(0, 1, 0).exit_code(), exit::DHT_UNAVAILABLE);
         assert_eq!(s(1, 1, 1).exit_code(), exit::VERIFY_FAILED);
+    }
+
+    #[test]
+    fn direct_message_waits_for_a_decryption_key_then_is_shown_once() {
+        let (alice, circle, _d, store) = setup();
+        let bob = Keys::new("bob");
+        let member = &circle.members[0];
+        let built = alice
+            .identity()
+            .build_direct(bob.ssh.public(), "for bob", 10, NOW, 3600)
+            .unwrap();
+        let f = Fetched::from(&built.item);
+        let poll = |inbox: &Inbox, now, emit_all| {
+            let mut events = Vec::new();
+            let mut summary = PollSummary::default();
+            let salt = inbox.slot_salt(member);
+            store
+                .update(|state| {
+                    let ctx = DirectCtx {
+                        inbox,
+                        salt: &salt,
+                        now,
+                        skew: 120,
+                        emit_all,
+                    };
+                    apply_direct(state, member, &f, &ctx, &mut events, &mut summary);
+                })
+                .unwrap();
+            (events, summary)
+        };
+
+        let agent_only = Inbox::new(
+            bob.ssh.public().clone(),
+            || Err(AGENT_CANNOT_DECRYPT.into()),
+        );
+        let (events, summary) = poll(&agent_only, NOW, false);
+        assert!(
+            matches!(&events[..], [Event::Error { detail, .. }] if detail.contains("ssh-agent")),
+            "{events:?}"
+        );
+        assert_eq!(summary.exit_code(), exit::NO_NEW);
+        let (events, _) = poll(&agent_only, NOW + 1, false);
+        assert!(events.is_empty(), "not repeated in follow mode: {events:?}");
+
+        let with_key = Inbox::for_signer(&bob.ssh);
+        let (events, summary) = poll(&with_key, NOW + 2, false);
+        assert!(
+            matches!(&events[..], [Event::DirectMessage { message, seq: 10, .. }] if message == "for bob"),
+            "{events:?}"
+        );
+        assert_eq!(summary.exit_code(), exit::OK);
+        let (events, _) = poll(&with_key, NOW + 3, true);
+        assert!(events.is_empty(), "shown once: {events:?}");
     }
 
     #[test]

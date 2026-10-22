@@ -8,8 +8,10 @@ use ssh_key::PublicKey;
 
 use crate::circle::{Circle, Member};
 use crate::config::{self, Config, Paths, SshConfig, ENV_SSH_PASSPHRASE};
+use crate::direct::Opener;
 use crate::exit::{self, coded, Coded, WithCode};
 use crate::net::{Net, NetConfig, NetError};
+use crate::ops::{Inbox, AGENT_CANNOT_DECRYPT};
 use crate::payload::validate_name;
 use crate::sshsig::{self, Signer};
 
@@ -214,6 +216,22 @@ pub fn ssh_public(cfg: &Config) -> Result<PublicKey, Coded> {
             sshsig::parse_public_key(public_key).map_err(|e| coded(exit::CONFIG, e))
         }
     }
+}
+
+/// What `listen` needs to receive direct messages: our SSH public key now, and the private key
+/// (possibly prompting for its passphrase) only once a direct message has to be decrypted.
+pub fn inbox(cfg: &Config) -> Result<Inbox, Coded> {
+    let public = ssh_public(cfg)?;
+    let ssh = cfg.ssh.clone();
+    Ok(Inbox::new(public, move || match &ssh {
+        SshConfig::File { key_path } => match signer_from_file(key_path)
+            .map_err(|e| e.to_string())?
+        {
+            Signer::File { key, .. } => Opener::from_private_key(&key).map_err(|e| e.to_string()),
+            Signer::Agent { .. } => unreachable!("loaded from a key file"),
+        },
+        SshConfig::Agent { .. } => Err(AGENT_CANNOT_DECRYPT.into()),
+    }))
 }
 
 pub fn own_card(paths: &Paths, cfg: &Config) -> Result<Member, Coded> {

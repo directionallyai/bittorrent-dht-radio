@@ -11,7 +11,8 @@ with no server, account or open port.
 * Listeners verify everything against a **locally pinned** circle (name → SSH key → DHT key). Nothing
   learned from the DHT is trusted.
 
-v1 scope: **small public announcements only**. No encryption, GUI, chat or large payloads
+v1 scope: **small announcements**: public broadcasts, plus short [direct messages](#direct-messages)
+encrypted to one member's SSH key. No GUI, chat history or large payloads
 (see [Threat model and limits](#threat-model-and-limits)).
 
 * [5-minute two-person setup](#5-minute-two-person-setup)
@@ -71,6 +72,9 @@ radio publish --message "Alice is online"
 radio listen
 radio listen --follow            # keep polling every 60s
 radio listen --json              # JSON lines for scripts
+
+# Alice, to Bob only (encrypted to his SSH key; Alice's broadcast is unchanged)
+radio publish --publish-to bob --message "the spare key is under the mat"
 ```
 
 Check on things any time with `radio status` (saved state, no network) and `radio doctor` (live
@@ -113,8 +117,9 @@ radio circle add --name bob --ssh-key-file bob_id.pub --dht-key <64 hex> [--salt
 | `radio card [--out FILE]` | Print your circle card again. |
 | `radio circle add\|list\|remove\|export` | Manage the pinned circle; import/export card files. |
 | `radio publish --message "…"` / `--file f.txt` (`-` = stdin) | Sign and put a message now. `--ttl 24h` sets how long it stays valid; `--no-prev` omits the previous-message hash. |
+| `radio publish --publish-to NAME --message "…"` (alias `--to`) | Send a [direct message](#direct-messages) to one pinned member, encrypted to their SSH key. |
 | `radio republish` | Re-put the **last already-signed item unchanged** (see below). |
-| `radio listen [--follow] [--interval 60s] [--jitter 10%] [--json]` | Poll every member's feed; print verified new messages and state changes. |
+| `radio listen [--follow] [--interval 60s] [--jitter 10%] [--json]` | Poll every member's feed (and their direct slot for you); print verified new messages and state changes. |
 | `radio run --status-file F --publish-every 15m --listen-every 60s [--jitter 10%] [--republish-every 1h]` | Publish and listen at the same time on independent intervals, unattended. |
 | `radio status` | Saved state, no network: last put/get results, republish times, per-member staleness. |
 | `radio doctor` | Live diagnostics: signer, bootstrap resolution, routing table, own record, members. |
@@ -231,6 +236,8 @@ failure has its own diagnostic (the `reason` of the `rejected` event):
 | `signer-mismatch` | the SSHSIG was made by *the pinned SSH key of that feed's owner* (feed-owner ↔ SSH-signer) |
 | `tampered-payload` | the signature actually covers this payload |
 | `sender-mismatch` / `seq-mismatch` | payload `from` is the pinned name; payload `seq` equals the BEP 44 `seq` |
+| `recipient-mismatch` | a broadcast has no `to:`; a [direct message](#direct-messages) is addressed to your SSH fingerprint |
+| `decrypt-failed` | a direct message decrypts with your SSH key (checked after the signature) |
 | `clock-skew` | `iat` is not further in the future than `clock_skew_secs` (default 120 s) |
 | `replay-rollback` / `seq-reuse` | `seq` is not below the highest accepted; the same `seq` never carries different content |
 | `expired` | `exp` has not passed (reported as a stale warning, not a failure) |
@@ -245,6 +252,38 @@ reported and skipped while the IP entries keep working. If the list is empty the
 (`router.bittorrent.com`, `dht.transmissionbt.com`, `dht.libtorrent.org`, `relay.pkarr.org`) are
 used. The routing table is saved to `cache/routing.txt` and reused as extra bootstrap peers on the
 next run; bootstrap retries with exponential backoff.
+
+### Direct messages
+
+`radio publish --publish-to bob` sends one message to one member whose card you have pinned.
+Bob receives it with his normal `radio listen` / `radio run`, as a `direct-message` event (human
+output: `… alice -> you: text (direct, …)`). Nobody else can read it.
+
+* **Its own slot.** The item is put under the sender's usual DHT key, but with the salt
+  `dm1-` + the first 16 bytes (hex) of `SHA-256("radio-direct-slot/1\n" ‖ sender salt ‖ "\n" ‖
+  recipient SSH public key)`. So it never replaces the broadcast, and each recipient has a slot of
+  their own. Listeners check, for every pinned member, that member's direct slot for their own key.
+* **Signed exactly like a broadcast.** The payload carries an extra header line
+  `to: SHA256:<recipient SSH fingerprint>` between `from:` and `seq:`. All the checks in the table
+  above apply, plus `recipient-mismatch` (a `to:` that is not you, or a `to:` in a broadcast slot)
+  and `decrypt-failed` (signed by the pinned key, but it does not decrypt for you).
+* **Encrypted to the SSH key.** The message text is `base64(E ‖ ChaCha20-Poly1305(text))`. The
+  recipient's Ed25519 SSH key is converted to X25519 (as `age` does for `ssh-ed25519`
+  recipients), `E` is a fresh ephemeral X25519 key, and key and nonce come from HKDF-SHA256 over
+  the shared secret (salt `E ‖ recipient`, info `bittorrent-dht-radio direct/1`). The associated
+  data is the signed header (`from`, `to`, `seq`, `iat`, `exp`), so nobody can lift the ciphertext
+  into an item signed by someone else.
+* **Size.** Encryption and base64 leave about 450 bytes for the text (exit 4 with the exact limit,
+  checked before signing).
+* **Decrypting needs the private key file.** ssh-agent can sign but cannot do the X25519 step. With
+  `--ssh-agent` you can still send direct messages, but received ones are reported as
+  `error: direct message from alice: … cannot be decrypted` and stay pending. An encrypted key file
+  is unlocked (passphrase from `RADIO_SSH_KEY_PASSPHRASE` or a prompt) only when a new direct
+  message arrives.
+* Only the latest direct message per sender→recipient pair is on the DHT. It ages out like any item
+  (about 2 hours) and is **not** re-put by `republish`. Direct messages are not `prev`-chained.
+  `state.json` keeps the sender's copy of what was sent, but the receiver does not store decrypted
+  text.
 
 **Safety of message content.** Messages are data: never passed to a shell, never interpreted. When
 printed to a terminal, control characters and bidi overrides are escaped.
@@ -338,8 +377,12 @@ to a GitHub release.
 `radio` is for small, **public** announcements among people who know each other. Know what it does
 and does not give you:
 
-* **Everything is public.** Anyone who knows (or guesses) your DHT public key and salt can read your
-  messages. There is no encryption in v1; do not publish secrets.
+* **Broadcasts are public.** Anyone who knows (or guesses) your DHT public key and salt can read your
+  broadcasts; do not publish secrets there. [Direct messages](#direct-messages) are encrypted, but
+  *that* one was sent, when, and its size are visible. Anyone who knows both the sender's DHT key
+  and the recipient's SSH public key can tell that the slot belongs to that pair. There is no
+  forward secrecy: whoever later gets the recipient's SSH private key can decrypt old direct
+  messages they recorded.
 * **IP metadata is exposed.** Publishing and polling are visible to the DHT nodes you talk to (and
   anyone watching them): your IP address, timing and which keys you look up. Your circle's membership
   can be inferred by someone who watches who polls your key. Use a VPN/Tor-style network layer if that
@@ -361,4 +404,4 @@ and does not give you:
   produces `clock-skew`/`expired` diagnostics.
 * **FIDO2 touch.** Touch-required keys cannot sign unattended (see above).
 * **Trust is only as good as your pinning.** Compare fingerprints out of band; there is no PKI.
-* **v1 scope:** no encryption, GUI, chat or large payloads; Ed25519 SSH keys only; IPv4 DHT only.
+* **v1 scope:** no GUI, chat history or large payloads; Ed25519 SSH keys only; IPv4 DHT only.
